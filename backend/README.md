@@ -13,4 +13,4 @@ See `../dev.md` for local setup, `../read.md` for the end-to-end design, and `..
 
 docker local run commands
 docker build --build-arg VITE_API_BASE_URL=http://localhost -t qualitylead .
-docker run -p 80:80 --env-file backend/.env qualitylead
+docker run --name qualitylead -p 80:80 --env-file backend/.env qualitylead
