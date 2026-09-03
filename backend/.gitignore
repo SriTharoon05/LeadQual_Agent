@@ -1,0 +1,118 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+Logs/
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# Type checkers
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation builds
+docs/_build/
+
+# Django
+db.sqlite3
+media/
+
+# Flask
+instance/
+.webassets-cache
+
+# FastAPI
+*.db
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Poetry
+poetry.lock
+
+# Pipenv
+Pipfile.lock
+
+# Ruff
+.ruff_cache/
+
+# UV
+.uv/
+
+# Local settings
+local_settings.py
+
+1.ps1
+AILEAD_PROJECT.md
+ailead_test_frontend.html
+bolt_prompt.md
+create_project_structure.py
+my_code_dump.txt
+create_project_structure.ps1
+project_export.txt
+
+sqlquery.sql
+test_web_researcher.py
+test_websearch.py
+validate_contact.py
+validate_contact_real.py
+websearch_cost_report.json
