@@ -1,0 +1,56 @@
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.Python
+**/venv/
+**/.venv/
+**/*.egg-info/
+**/.pytest_cache/
+
+# Node
+**/node_modules/
+**/dist/
+**/.next/
+
+# Environment files
+**/.env
+**/.env.*
+!**/.env.example
+
+# Git
+.git/
+.gitignore
+
+# Docker
+.dockerignore
+**/Dockerfile
+docker-compose*.yml
+
+# Logs
+**/*.log
+**/logs/
+
+# OS
+**/.DS_Store
+**/Thumbs.db
+
+# IDE
+**/.vscode/
+**/.idea/
+**/*.swp
+
+# Tests
+**/tests/
+**/.coverage
+**/htmlcov/
+
+# Alembic (migrations not needed in image)
+**/migrations/
+
+# Misc
+README.md
+**/README.md
+extract.py
+extracted_Codes/

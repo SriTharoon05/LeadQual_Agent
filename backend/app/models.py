@@ -1,0 +1,362 @@
+"""
+models.py
+─────────
+SQLAlchemy ORM models — one class per Azure SQL table.
+Mirrors the schema exactly. Import Base from database.py.
+
+Import pattern everywhere else:
+    from app.models import Job, Lead, ValidationResult, FinalScore, ProcessingLog
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import (
+    Boolean, DateTime, Float, ForeignKey,
+    Integer, String, Text, func,
+)
+from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.database import Base
+
+def _new_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+# ── jobs ──────────────────────────────────────────────────────────────────────
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
+    )
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="queued")
+    # queued | running | completed | failed
+
+    total_rows: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    processed_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    icp_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    file_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    file_type: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    duplicates_removed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    import_error:       Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # xlsx | csv
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.getutcdate()
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # ── Add to Job model (inside the class, after existing mapped_column lines) ──
+    llm_model:      Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    embed_model:    Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    total_tokens_used: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    prompt_tokens:  Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Relationships
+    leads: Mapped[list["Lead"]] = relationship(
+        "Lead", back_populates="job", cascade="all, delete-orphan"
+    )
+    logs: Mapped[list["ProcessingLog"]] = relationship(
+        "ProcessingLog", back_populates="job", cascade="all, delete-orphan",
+        foreign_keys="ProcessingLog.job_id",
+    )
+
+    llm_call_logs: Mapped[list["LLMCallLog"]] = relationship(
+        "LLMCallLog", cascade="all, delete-orphan",
+        foreign_keys="LLMCallLog.job_id",
+    )    
+
+    @property
+    def progress_pct(self) -> float:
+        if not self.total_rows:
+            return 0.0
+        return round((self.processed_rows / self.total_rows) * 100, 1)
+
+    def __repr__(self) -> str:
+        return f"<Job id={self.id} status={self.status} rows={self.processed_rows}/{self.total_rows}>"
+
+
+# ── llm_call_logs ─────────────────────────────────────────────────────────────
+class LLMCallLog(Base):
+    __tablename__ = "llm_call_logs"
+
+    id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
+    )
+    job_id: Mapped[Optional[str]] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("jobs.id"), nullable=True
+    )
+    lead_id: Mapped[Optional[str]] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("leads.id"), nullable=True
+    )
+    stage: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    module: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    prompt_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    model: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    use_web_search: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    web_search_calls: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.getutcdate()
+    )
+
+    def __repr__(self) -> str:
+        return (f"<LLMCallLog stage={self.stage} tokens={self.total_tokens} "
+                f"job={self.job_id}>")
+
+# ── leads ─────────────────────────────────────────────────────────────────────
+class Lead(Base):
+    __tablename__ = "leads"
+
+    id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
+    )
+    job_id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("jobs.id"), nullable=False
+    )
+    row_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # ── Contact Information (cols 1–8) ────────────────────────────────────────
+    contact_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    job_title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    contact_department: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    contact_seniority: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    linkedin_profile_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    email_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    phone_number: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    direct_phone_number: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # ── Contact Location (cols 9–11) ──────────────────────────────────────────
+    contact_country: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    contact_state_region: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    contact_city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    # ── Company Information (cols 12–20) ──────────────────────────────────────
+    company_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    company_website: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    company_linkedin_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    industry: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    sub_industry: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    employee_count: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    annual_revenue: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    company_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # AI FILL
+    technologies_used: Mapped[Optional[str]] = mapped_column(Text, nullable=True)    # AI FILL
+
+    # ── Company Location (cols 21–25) ─────────────────────────────────────────
+    company_country: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    company_state_region: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    company_city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    company_hq_location: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    hq_phone_number: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # ── Additional Information (cols 26–29) ───────────────────────────────────
+    crm_account_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    crm_contact_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    lead_source: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    processing_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.getutcdate()
+    )
+
+    # Relationships
+    job: Mapped["Job"] = relationship("Job", back_populates="leads")
+    validation_results: Mapped[list["ValidationResult"]] = relationship(
+        "ValidationResult", back_populates="lead", cascade="all, delete-orphan"
+    )
+    final_score: Mapped[Optional["FinalScore"]] = relationship(
+        "FinalScore", back_populates="lead", uselist=False, cascade="all, delete-orphan"
+    )
+    company_scrape: Mapped[Optional["CompanyScrape"]] = relationship(
+        "CompanyScrape", back_populates="lead", uselist=False, cascade="all, delete-orphan"
+    )
+    logs: Mapped[list["ProcessingLog"]] = relationship(
+        "ProcessingLog", back_populates="lead", cascade="all, delete-orphan",
+        foreign_keys="ProcessingLog.lead_id",
+    )
+    llm_call_logs: Mapped[list["LLMCallLog"]] = relationship(
+        "LLMCallLog", cascade="all, delete-orphan",
+        foreign_keys="LLMCallLog.lead_id",
+    )
+
+    def __repr__(self) -> str:
+        return f"<Lead id={self.id} name={self.contact_name} company={self.company_name}>"
+
+
+# ── validation_results ────────────────────────────────────────────────────────
+class ValidationResult(Base):
+    __tablename__ = "validation_results"
+
+    id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
+    )
+    lead_id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("leads.id"), nullable=False
+    )
+    stage: Mapped[str] = mapped_column(String(50), nullable=False)
+    # icp | web | contact
+
+    passed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    raw_output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)   # full JSON
+    sources_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True) # URL array as JSON
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.getutcdate()
+    )
+
+    # Relationships
+    lead: Mapped["Lead"] = relationship("Lead", back_populates="validation_results")
+
+    def __repr__(self) -> str:
+        return f"<ValidationResult lead={self.lead_id} stage={self.stage} passed={self.passed}>"
+
+
+# ── final_scores ──────────────────────────────────────────────────────────────
+class FinalScore(Base):
+    __tablename__ = "final_scores"
+
+    id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
+    )
+    lead_id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("leads.id"), nullable=False
+    )
+
+    total_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    icp_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    authority_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    data_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    growth_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    contact_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    priority: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # High | Medium | Low
+
+    reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    growth_signals: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    outreach_intelligence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.getutcdate()
+    )
+
+    # Relationships
+    lead: Mapped["Lead"] = relationship("Lead", back_populates="final_score")
+
+    def __repr__(self) -> str:
+        return f"<FinalScore lead={self.lead_id} total={self.total_score} priority={self.priority}>"
+
+
+# ── company_scrape (Phase 2 — schema only, not used yet) ─────────────────────
+# ── company_scrape (RAG ingestion) ────────────────────────────────────────────
+class CompanyScrape(Base):
+    __tablename__ = "company_scrape"
+
+    id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
+    )
+    job_id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("jobs.id"), nullable=False, index=True
+    )
+    lead_id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("leads.id"), nullable=False, index=True
+    )
+
+    company_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    website_url:  Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    clean_text:   Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    blob_path:    Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    chunk_count:  Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    embedded:     Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 0=pending 1=done
+
+    scraped_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.getutcdate()
+    )
+
+    # Relationships
+    lead: Mapped["Lead"] = relationship("Lead", back_populates="company_scrape")
+
+    def __repr__(self) -> str:
+        return f"<CompanyScrape lead={self.lead_id} url={self.website_url} embedded={self.embedded}>"
+
+
+# ── admin_users ───────────────────────────────────────────────────────────────
+class AdminUser(Base):
+    __tablename__ = "admin_users"
+
+    id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
+    )
+    username: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    password: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<AdminUser username={self.username}>"
+
+
+# ── chat_message (session-scoped chatbot history) ─────────────────────────────
+class ChatMessage(Base):
+    __tablename__ = "chat_message"
+
+    id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
+    )
+    job_id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("jobs.id"), nullable=False, index=True
+    )
+    role:    Mapped[str] = mapped_column(String(20), nullable=False)   # user | assistant
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.getutcdate()
+    )
+
+    def __repr__(self) -> str:
+        return f"<ChatMessage job={self.job_id} role={self.role}>"
+
+
+
+
+# ── processing_logs ───────────────────────────────────────────────────────────
+class ProcessingLog(Base):
+    __tablename__ = "processing_logs"
+
+    id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
+    )
+    job_id: Mapped[Optional[str]] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("jobs.id"), nullable=True
+    )
+    lead_id: Mapped[Optional[str]] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("leads.id"), nullable=True
+    )
+
+    level: Mapped[str] = mapped_column(String(20), nullable=False, default="INFO")
+    # INFO | WARNING | ERROR
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.getutcdate()
+    )
+
+    # Relationships
+    job: Mapped[Optional["Job"]] = relationship(
+        "Job", back_populates="logs", foreign_keys=[job_id]
+    )
+    lead: Mapped[Optional["Lead"]] = relationship(
+        "Lead", back_populates="logs", foreign_keys=[lead_id]
+    )
+
+    def __repr__(self) -> str:
+        return f"<ProcessingLog [{self.level}] job={self.job_id} lead={self.lead_id}>"
