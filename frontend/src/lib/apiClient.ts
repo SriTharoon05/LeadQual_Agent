@@ -17,13 +17,17 @@ apiClient.interceptors.request.use((config) => {
 });
 
 // On 401 clear storage and redirect to login
+let isRedirecting = false;
+
 apiClient.interceptors.response.use(
   (res) => res,
   (err) => {
-    if (err.response?.status === 401) {
+    if (err.response?.status === 401 && !isRedirecting) {
+      isRedirecting = true;
       localStorage.removeItem('token');
       localStorage.removeItem('username');
-      window.location.href = '/login';
+      // Use replace instead of href to avoid showing raw JSON
+      window.location.replace('/login');
     }
     return Promise.reject(err);
   },
