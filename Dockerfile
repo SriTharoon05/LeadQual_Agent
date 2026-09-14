@@ -45,6 +45,7 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
 # Copy backend app
 COPY backend/app ./app
+COPY backend/scripts ./scripts
 
 # Copy built frontend
 COPY --from=frontend-build /frontend/dist /var/www/frontend

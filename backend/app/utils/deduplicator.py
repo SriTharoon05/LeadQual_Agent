@@ -1,103 +1,48 @@
-"""
-utils/deduplicator.py
-──────────────────────
-Removes duplicate rows from the parsed DataFrame before processing.
-
-Deduplication strategy (in order, first match wins):
-  1. Exact CRM Contact ID match (crm_contact_id) — strongest signal
-  2. Exact email address match (case-insensitive)
-  3. Normalized exact name + company match — catches casing/punctuation variants
-
-The first occurrence of each duplicate group is kept; subsequent ones
-are dropped and logged.
-
-Import pattern:
-    from app.utils.deduplicator import deduplicate
-
-    df, stats = deduplicate(df)
-    # stats: {"original": int, "duplicates_removed": int, "final": int}
-"""
-
+"""Remove unambiguous duplicate people within a file using the DB identity rules."""
 import logging
+
 import pandas as pd
-import re
+
+from app.utils.lead_identity import KEY_FIELDS, identity_fields, words
 
 logger = logging.getLogger(__name__)
 
+
 def deduplicate(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
-    """
-    Remove duplicate lead rows from a 29-column DataFrame.
-
-    Returns:
-        (deduplicated_df, stats_dict)
-        stats_dict has keys: original, duplicates_removed, final
-    """
-    original_count = len(df)
-    keep = [True] * len(df)   # True = keep this row
-
-    # ── Pass 1: CRM Contact ID ────────────────────────────────────────────────
-    if "CRM Contact ID" in df.columns:
-        seen_ids: set[str] = set()
-        for i, val in enumerate(df["CRM Contact ID"]):
-            v = str(val).strip().lower()
-            if v and v not in ("", "nan", "none"):
-                if v in seen_ids:
-                    keep[i] = False
-                else:
-                    seen_ids.add(v)
-
-    # ── Pass 2: Email address ─────────────────────────────────────────────────
-    if "Email Address" in df.columns:
-        seen_emails: set[str] = set()
-        for i, val in enumerate(df["Email Address"]):
-            if not keep[i]:
-                continue
-            v = str(val).strip().lower()
-            if v and v not in ("", "nan", "none"):
-                if v in seen_emails:
-                    keep[i] = False
-                else:
-                    seen_emails.add(v)
-
-    # ── Pass 3: normalized exact name + company ──────────────────────────────
-    name_col    = "Contact Name"    if "Contact Name"    in df.columns else None
-    company_col = "Company Name"    if "Company Name"    in df.columns else None
-
-    if name_col and company_col:
-        seen_people: set[str] = set()
-
-        for i in range(len(df)):
-            if not keep[i]:
-                continue
-
-            name    = str(df.iloc[i][name_col]).strip().lower()
-            company = str(df.iloc[i][company_col]).strip().lower()
-
-            if not name and not company:
-                continue
-
-            norm_name = _normalise(name)
-            norm_company = _normalise(company)
-            signature = f"{norm_name}|{norm_company}"
-            if signature in seen_people:
-                keep[i] = False
-            else:
-                seen_people.add(signature)
-
-    # ── Apply mask ────────────────────────────────────────────────────────────
-    clean_df = df[keep].reset_index(drop=True)
-    removed  = original_count - len(clean_df)
-
-    if removed > 0:
-        logger.info(f"Deduplicator: removed {removed} duplicates ({original_count} → {len(clean_df)} rows)")
-
-    stats = {
-        "original":           original_count,
-        "duplicates_removed": removed,
-        "final":              len(clean_df),
+    columns = {
+        "CRM Contact ID": "crm_contact_id", "Email Address": "email_address",
+        "LinkedIn Profile URL": "linkedin_profile_url", "Contact Name": "contact_name",
+        "Company Name": "company_name",
     }
-    return clean_df, stats
+    index = {}
+    identities = []
+    kept = []
+    for position, row in enumerate(df.to_dict("records")):
+        keys = identity_fields({field: row.get(column) for column, field in columns.items()})
+        candidates = set()
+        for key, value in keys.items():
+            if value:
+                candidates.update(index.get((key, value), set()))
+        valid = [i for i in candidates if not any(
+            keys[key] and identities[i][key] and keys[key] != identities[i][key]
+            for key in KEY_FIELDS[:3])]
+        if len(valid) == 1:
+            identity = valid[0]
+            for key, value in keys.items():
+                if value and not identities[identity][key]:
+                    identities[identity][key] = value
+        else:
+            identity = len(identities)
+            identities.append(keys.copy())
+            kept.append(position)
+        for key, value in keys.items():
+            if value:
+                index.setdefault((key, value), set()).add(identity)
+    clean = df.iloc[kept].reset_index(drop=True)
+    stats = {"original": len(df), "duplicates_removed": len(df) - len(clean), "final": len(clean)}
+    logger.info("File deduplication: %s", stats)
+    return clean, stats
 
 
 def _normalise(value: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", value.lower())
+    return words(value)

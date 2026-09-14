@@ -33,6 +33,7 @@ from app.models import Job, Lead
 from app.parsers.excel_parser import parse_excel
 from app.parsers.csv_parser import parse_csv
 from app.utils.deduplicator import deduplicate
+from app.utils.lead_identity import assign_identities, transaction_lock
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,8 @@ def import_file(self, job_id: str, blob_name: str, suffix: str, filename: str):
             raise self.retry(countdown=15)
 
         try:
+            if job.status != "importing":
+                return  # Celery redelivery must not append the same file twice.
             raw_bytes = _download_blob(blob_name)
             if not raw_bytes:
                 _fail(db, job, "Could not read the uploaded file from storage.")
@@ -134,7 +137,11 @@ def import_file(self, job_id: str, blob_name: str, suffix: str, filename: str):
                     "processing_status":    "pending",
                 })
 
-            # Bound memory/parameter pressure while retaining executemany speed.
+            transaction_lock(db, "ql:lead-import")
+            db.refresh(job)
+            if job.status != "importing":
+                return
+            assign_identities(db, mappings)
             for start in range(0, len(mappings), 2000):
                 db.bulk_insert_mappings(Lead, mappings[start:start + 2000])
 
@@ -153,15 +160,21 @@ def import_file(self, job_id: str, blob_name: str, suffix: str, filename: str):
 
         except ValueError as e:
             # Parsing errors (bad file, unreadable) — user-facing, no retry.
+            db.rollback()
             _fail(db, job, str(e))
         except Exception as e:
             logger.error(f"import_file failed for {job_id}: {e}")
-            _fail(db, job, f"Import failed: {e}")
+            db.rollback()
+            _fail(db, job, "Import failed. Please retry or contact support.")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _fail(db, job, message: str) -> None:
     try:
+        transaction_lock(db, "ql:lead-import")
+        db.refresh(job)
+        if job.status != "importing":
+            return
         job.status = "import_failed"
         job.import_error = (message or "Import failed")[:1000]
         db.flush()

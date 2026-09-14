@@ -103,6 +103,50 @@ def db_session() -> Generator[Session, None, None]:
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
+@contextmanager
+def locked_lead_session(lead_id: str):
+    """A SQL session lock survives stage commits and serializes matching leads.
+
+    SQL Server releases it on disconnect, including worker crashes. No Redis
+    lease can expire mid-research and let a second worker repeat paid calls.
+    """
+    with engine.connect() as connection:
+        db = Session(bind=connection, expire_on_commit=False)
+        resource = None
+        try:
+            from app.models import Lead
+            lead = db.get(Lead, lead_id)
+            resource = "ql:process:" + str(lead.tracking_id or lead.id) if lead else None
+            db.rollback()
+            if resource and connection.dialect.name == "mssql":
+                result = connection.execute(text("""
+                    SET NOCOUNT ON;
+                    DECLARE @result int;
+                    EXEC @result = sp_getapplock @Resource=:resource,
+                         @LockMode='Exclusive', @LockOwner='Session', @LockTimeout=30000;
+                    SELECT @result;
+                """), {"resource": resource}).scalar()
+                connection.commit()
+                if result is None or result < 0:
+                    resource = None
+                    raise TimeoutError("Lead is being processed by another worker")
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+            if resource and connection.dialect.name == "mssql":
+                try:
+                    connection.execute(text(
+                        "EXEC sp_releaseapplock @Resource=:resource, @LockOwner='Session'"
+                    ), {"resource": resource})
+                    connection.commit()
+                except Exception:
+                    connection.invalidate()  # Never return a locked connection to the pool.
+
+
 def ping_db() -> bool:
     """Return True if the database is reachable."""
     try:
@@ -111,4 +155,24 @@ def ping_db() -> bool:
         return True
     except Exception as e:
         logger.error(f"Database ping failed: {e}")
+        return False
+
+
+def schema_ready() -> bool:
+    """Prevent routing traffic to new code before its migration/backfill is done."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                SELECT TOP 0 l.tracking_id, l.crm_key, l.email_key, l.linkedin_key,
+                    l.person_company_key, l.input_fingerprint, l.research_fingerprint,
+                    l.reused_from_lead_id, l.reuse_kind, t.reviewed, t.notes, t.version,
+                    j.reused_rows, j.research_reused_rows
+                FROM leads l JOIN lead_tracking t ON t.id=l.tracking_id
+                JOIN jobs j ON j.id=l.job_id
+            """))
+            if conn.execute(text("SELECT TOP 1 id FROM leads WHERE tracking_id IS NULL")).first():
+                return False
+        return True
+    except Exception:
+        logger.warning("Lead reuse schema is not ready; run scripts/migrate_lead_reuse.py")
         return False

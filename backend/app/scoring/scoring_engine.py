@@ -201,6 +201,9 @@ def _build_prompt(lead_data, icp_result, web_result, contact_result) -> str:
 
     return f"""
 Score this B2B lead 0-100 using the stage results below.
+Verified facts and ICP checks override uploaded claims. Unknown/conflicting facts
+must be described as unclear, never asserted as verified. No employment evidence
+means unclear, not former. Explain concrete values and mismatches in reasoning.
 
 LEAD:
 {lead_summary}
@@ -220,6 +223,8 @@ STAGE 2 — WEB:
   techs={len(_get(web_result,'technologies_found') or [])} found
   has_growth={bool(_get(web_result,'growth_signals') and 'none' not in str(_get(web_result,'growth_signals','')).lower())}
   company_summary={_s(_get(web_result,'company_summary'))[:400]}
+  verified_facts={json.dumps(_get(web_result, "evidence", {}), default=str)}
+  icp_checks={json.dumps(_get(icp_result, "checks", {}), default=str)}
   technologies={_s(_get(web_result,'technologies_found'))[:300]}
   growth_evidence={_s(_get(web_result,'growth_signals'))[:500]}
 

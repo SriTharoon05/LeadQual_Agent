@@ -8,6 +8,7 @@ import {
   ChevronsLeft, ChevronsRight, Building2, Mail, Loader2, Target, Zap,
 } from 'lucide-react';
 import { TopBar } from '@/components/TopBar';
+import { LeadTracking } from '@/components/LeadTracking';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Badge, StatusBadge, PriorityBadge, ScoreChip } from '@/components/ui/Badge';
@@ -15,7 +16,7 @@ import { Input, Label, Textarea } from '@/components/ui/Input';
 import { TableSkeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/pages/DashboardPage';
 import { useToast } from '@/components/ui/Toast';
-import { getJobStatus, getResultsPage, getJobs, deleteJob, downloadExport, startIcp } from '@/api/endpoints';
+import { getJobStatus, getResultsPage, getJobs, deleteJob, downloadExport, startIcp, getLeadDetail } from '@/api/endpoints';
 import { dash, fmtDate, safeArr } from '@/lib/format';
 import type { LeadResult, Priority } from '@/types';
 
@@ -53,7 +54,7 @@ export function JobDetailPage() {
     queryFn: () => getJobStatus(jobId),
     refetchInterval: (q) => {
       const s = q.state.data?.status;
-      return s === 'completed' || s === 'failed' ? false : 3000;
+      return s === 'completed' || s === 'failed' || s === 'import_failed' ? false : 3000;
     },
     placeholderData: (prev) => prev,
     refetchOnWindowFocus: false,
@@ -73,7 +74,7 @@ export function JobDetailPage() {
     queryFn: () => getResultsPage(jobId, page * PAGE_SIZE, PAGE_SIZE, {
       search: deferredSearch, priority: priorityFilter, sortBy: sortKey, sortDir,
     }),
-    enabled: isCompleted,
+    enabled: isCompleted || status?.status === 'failed',
     placeholderData: (prev) => prev,       // ← keep old rows visible → no flicker
     refetchOnWindowFocus: false,
   });
@@ -119,9 +120,15 @@ export function JobDetailPage() {
     }
   };
 
-  const openLead = (lead: LeadResult) => {
-    setSelectedLead(lead);
-    setDrawerOpen(true);
+  const openLead = async (lead: LeadResult) => {
+    try {
+      const fresh = await getLeadDetail(jobId, lead.lead_id);
+      setSelectedLead(fresh);
+      setDrawerOpen(true);
+    } catch { toast('Could not load lead details', 'error'); }
+  };
+  const trackingSaved = (lead: LeadResult) => {
+    setSelectedLead((current) => current?.lead_id === lead.lead_id ? lead : current);
   };
 
   const goToPage = (p: number) => setPage(Math.max(0, Math.min(totalPages - 1, p)));
@@ -256,6 +263,11 @@ export function JobDetailPage() {
           </Card>
         )}
 
+        {status && (status.reused_rows > 0 || status.research_reused_rows > 0) && (
+          <div className="rounded-xl border border-sky-200 bg-sky-50 px-5 py-3 text-sm text-sky-900">
+            <strong>{status.reused_rows || 0}</strong> saved results reused · <strong>{status.research_reused_rows || 0}</strong> leads qualified using saved research · <strong>{Math.max(0, status.processed_rows - status.failed_rows - (status.reused_rows || 0) - (status.research_reused_rows || 0))}</strong> newly researched
+          </div>
+        )}
         {/* Results table */}
         <Card className="overflow-hidden">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-6 py-4 border-b border-slate-100">
@@ -322,6 +334,8 @@ export function JobDetailPage() {
                       <Th onClick={() => toggleSort('final_score')}><span className="flex items-center gap-1">Score {sortIcon('final_score')}</span></Th>
                       <Th onClick={() => toggleSort('priority')}><span className="flex items-center gap-1">Priority {sortIcon('priority')}</span></Th>
                       <Th>Validation</Th>
+                      <Th>Reviewed</Th>
+                      <Th>Notes / history</Th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-50">
@@ -338,6 +352,14 @@ export function JobDetailPage() {
                         <td className="px-4 py-3"><PriorityBadge priority={lead.priority} /></td>
                         <td className="px-4 py-3">
                           {lead.validation_status ? <Badge color={lead.validation_status === 'Passed' ? 'success' : 'warning'}>{lead.validation_status}</Badge> : <span className="text-slate-400">—</span>}
+                        </td>
+                        <td className="px-4 py-3"><LeadTracking lead={lead} jobId={jobId} onSaved={trackingSaved} /></td>
+                        <td className="px-4 py-3 max-w-[180px]">
+                          <button type="button" onClick={(event) => { event.stopPropagation(); void openLead(lead); }}
+                            className="block max-w-full truncate text-left text-xs text-brand-700 hover:underline">
+                            {lead.tracking_notes || 'Add notes'}
+                          </button>
+                          {lead.reuse_kind && <span className="mt-1 block text-xs text-sky-700">{lead.reuse_kind === 'full' ? 'Result reused' : 'Research reused'}</span>}
                         </td>
                       </tr>
                     ))}
@@ -356,6 +378,11 @@ export function JobDetailPage() {
                     <div className="flex items-center gap-2 mt-1 text-xs text-slate-500">
                       <span>{dash(lead.contact_name)}</span>
                       <PriorityBadge priority={lead.priority} />
+                    </div>
+                    <div className="my-2 flex items-center gap-2 text-xs text-slate-500">
+                      <LeadTracking lead={lead} jobId={jobId} onSaved={trackingSaved} /> Reviewed
+                      <button type="button" onClick={(event) => { event.stopPropagation(); void openLead(lead); }} className="text-brand-700 underline">{lead.tracking_notes ? 'View notes' : 'Add notes'}</button>
+                      {lead.reuse_kind && <span className="text-sky-700">{lead.reuse_kind === 'full' ? 'Result reused' : 'Research reused'}</span>}
                     </div>
                     {lead.email_address && (
                       <div className="flex items-center gap-1 mt-1 text-xs text-slate-400">
@@ -404,7 +431,7 @@ export function JobDetailPage() {
       {/* Lead drawer */}
       {drawerOpen && (
         <Suspense fallback={null}>
-          <LeadDetailDrawer lead={selectedLead} open={drawerOpen} onClose={() => setDrawerOpen(false)} />
+          <LeadDetailDrawer jobId={jobId} onSaved={trackingSaved} lead={selectedLead} open={drawerOpen} onClose={() => setDrawerOpen(false)} />
         </Suspense>
       )}
 

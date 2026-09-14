@@ -120,6 +120,14 @@ export const getLeadDetail = async (jobId: string, leadId: string): Promise<Lead
   return data;
 };
 
+export const updateLeadTracking = async (
+  jobId: string, leadId: string,
+  changes: { version: number; reviewed?: boolean; notes?: string },
+): Promise<LeadResult> => {
+  const { data } = await apiClient.patch<LeadResult>(`/jobs/${jobId}/results/${leadId}/tracking`, changes);
+  return data;
+};
+
 export const deleteJob = async (jobId: string): Promise<void> => {
   await apiClient.delete(`/jobs/${jobId}`);
 };

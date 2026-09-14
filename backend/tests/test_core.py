@@ -1,10 +1,9 @@
 import pandas as pd
-from fastapi.testclient import TestClient
-
 from app.auth import create_access_token, verify_access_token
 from app.main import app
 from app.scoring.scoring_engine import _parse_response
 from app.utils.deduplicator import deduplicate
+from fastapi.testclient import TestClient
 
 
 def test_signed_token_round_trip():

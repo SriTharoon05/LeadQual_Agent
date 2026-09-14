@@ -35,12 +35,14 @@ from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import case, func, or_
+from sqlalchemy import case, func, or_, update
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.config import settings, SUPPORTED_EXTENSIONS
-from app.database import get_db, ping_db
-from app.models import Job, Lead, FinalScore, ValidationResult, AdminUser
+from app.database import get_db, ping_db, schema_ready
+from app.models import Job, Lead, FinalScore, ValidationResult, AdminUser, LeadTracking
+from app.utils.lead_identity import json_object, transaction_lock
+from app.validators.evidence import proof_rows, clean_sources
 from app.export.result_builder import build_excel_bytes, build_csv_bytes
 from app.tasks.tasks import process_lead, finalise_job
 from app.chat.routes import router as chat_router
@@ -96,6 +98,9 @@ class JobStatusResponse(BaseModel):
     total_rows:     Optional[int] = None
     processed_rows: int
     failed_rows:    int = 0
+    reused_rows: int = 0
+    research_reused_rows: int = 0
+    icp_prompt: Optional[str] = None
     progress_pct:   float
     duplicates_removed: Optional[int] = None   # ← ADD
     import_error:       Optional[str] = None   # ← ADD
@@ -110,6 +115,15 @@ class JobStatusResponse(BaseModel):
 
 class LeadResultResponse(BaseModel):
     lead_id:        str
+    reviewed: bool = False
+    tracking_notes: str = ""
+    tracking_version: int = 0
+    reuse_kind: Optional[str] = None
+    reused_from_lead_id: Optional[str] = None
+    icp_input: Optional[str] = None
+    icp_proofs: list[dict] = Field(default_factory=list)
+    evidence_checked_at: Optional[str] = None
+    employment_status: str = "unclear"
     contact_name:   Optional[str] = None
     company_name:   Optional[str] = None
     job_title:      Optional[str] = None
@@ -138,6 +152,12 @@ class PaginatedResults(BaseModel):
     offset:      int          # starting index of this page
     returned:    int          # number of items in this page
     has_more:    bool         # whether more pages exist after this one
+
+
+class TrackingUpdate(BaseModel):
+    version: int = Field(ge=0)
+    reviewed: Optional[bool] = None
+    notes: Optional[str] = Field(default=None, max_length=10000)
 
 
 class UploadResponse(BaseModel):
@@ -263,6 +283,7 @@ def submit_icp(
     Attach an ICP prompt to a job and dispatch all Celery tasks.
     Returns immediately — frontend polls /jobs/{job_id}/status.
     """
+    transaction_lock(db, "ql:dispatch:" + job_id)
     job: Job = _get_job_or_404(job_id, db)
 
     if job.status not in ("queued",):
@@ -412,7 +433,7 @@ def job_results(
     leads = (
         base
         .options(
-            joinedload(Lead.final_score),           # 1-to-1 → JOIN in the same query
+            joinedload(Lead.job), joinedload(Lead.final_score),           # 1-to-1 → JOIN in the same query
             selectinload(Lead.validation_results),  # 1-to-many → one extra IN() query
         )
         .order_by(order, Lead.row_index.asc())
@@ -442,7 +463,7 @@ def lead_result(job_id: str, lead_id: str, db: Session = Depends(get_db)):
         db.query(Lead)
         .filter(Lead.id == lead_id, Lead.job_id == job_id)
         .options(
-            joinedload(Lead.final_score),
+            joinedload(Lead.job), joinedload(Lead.final_score),
             selectinload(Lead.validation_results),
         )
         .first()
@@ -453,6 +474,34 @@ def lead_result(job_id: str, lead_id: str, db: Session = Depends(get_db)):
 
 
 # ── GET /jobs/{job_id}/export/excel ──────────────────────────────────────────
+@app.patch("/jobs/{job_id}/results/{lead_id}/tracking", response_model=LeadResultResponse)
+def update_tracking(job_id: str, lead_id: str, body: TrackingUpdate,
+                    db: Session = Depends(get_db)):
+    lead = db.query(Lead).filter(Lead.id == lead_id, Lead.job_id == job_id).first()
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if not lead.tracking_id:
+        raise HTTPException(status_code=409, detail="Lead tracking requires the database migration")
+    changes = {}
+    for field, column in (("reviewed", "reviewed"), ("notes", "notes")):
+        if field in body.model_fields_set:
+            value = getattr(body, field)
+            if value is None:
+                raise HTTPException(status_code=422, detail=f"{field} cannot be null")
+            changes[column] = value
+    if not changes:
+        raise HTTPException(status_code=422, detail="Provide reviewed or notes")
+    changes.update(version=LeadTracking.version + 1, updated_at=datetime.now(timezone.utc).replace(tzinfo=None))
+    result = db.execute(update(LeadTracking).where(
+        LeadTracking.id == lead.tracking_id, LeadTracking.version == body.version
+    ).values(**changes).execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        raise HTTPException(status_code=409, detail="Tracking changed elsewhere. Reload the lead and try again.")
+    db.commit()
+    db.expire_all()
+    return _lead_to_response(lead)
+
+
 @app.get("/jobs/{job_id}/export/excel")
 def export_excel(job_id: str, db: Session = Depends(get_db)):
     """Build and STREAM the enriched .xlsx (no blob redirect → no CORS issues)."""
@@ -486,7 +535,11 @@ def export_csv(job_id: str, db: Session = Depends(get_db)):
 @app.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_job(job_id: str, db: Session = Depends(get_db)):
     """Delete a job and all associated data (cascade + Qdrant vectors)."""
+    transaction_lock(db, "ql:dispatch:" + job_id)
     job = _get_job_or_404(job_id, db)
+
+    if job.status in {"running", "importing"}:
+        raise HTTPException(status_code=409, detail="Wait until processing finishes before deleting this job.")
 
     # Remove this session's vectors from Qdrant (best-effort — never block delete).
     try:
@@ -495,7 +548,16 @@ def delete_job(job_id: str, db: Session = Depends(get_db)):
         logger.warning(f"Failed to delete Qdrant vectors for job {job_id}: {e}")
     _delete_job_blobs(job_id)
 
+    transaction_lock(db, "ql:lead-import")
+    tracking_ids = [row[0] for row in db.query(Lead.tracking_id).filter(
+        Lead.job_id == job_id, Lead.tracking_id.isnot(None)).distinct().all()]
     db.delete(job)
+    db.flush()
+    for start in range(0, len(tracking_ids), 500):
+        db.query(LeadTracking).filter(
+            LeadTracking.id.in_(tracking_ids[start:start + 500]),
+            ~db.query(Lead.id).filter(Lead.tracking_id == LeadTracking.id).exists(),
+        ).delete(synchronize_session=False)
     logger.info(f"Job {job_id} deleted")
 
 @app.get("/jobs/{job_id}/token-report")
@@ -564,13 +626,14 @@ def readiness():
     redis_ok = False
     try:
         import redis
-        redis_ok = bool(redis.Redis.from_url(settings.REDIS_URL).ping())
+        redis_ok = bool(redis.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=3, socket_timeout=3).ping())
     except Exception:
         logger.exception("Redis readiness check failed")
     db_ok = ping_db()
-    if not (db_ok and redis_ok):
-        raise HTTPException(status_code=503, detail={"database": db_ok, "redis": redis_ok})
-    return {"status": "ready", "database": "ok", "redis": "ok"}
+    schema_ok = schema_ready() if db_ok else False
+    if not (db_ok and redis_ok and schema_ok):
+        raise HTTPException(status_code=503, detail={"database": db_ok, "redis": redis_ok, "schema": schema_ok})
+    return {"status": "ready", "database": "ok", "redis": "ok", "schema": "ok"}
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -598,6 +661,9 @@ def _job_to_status(job: Job) -> JobStatusResponse:
         total_rows=         job.total_rows,
         processed_rows=     job.processed_rows,
         failed_rows=        getattr(job, "failed_rows", 0) or 0,
+        reused_rows=job.reused_rows or 0,
+        research_reused_rows=job.research_reused_rows or 0,
+        icp_prompt=job.icp_prompt,
         progress_pct=       job.progress_pct,
         duplicates_removed= getattr(job, "duplicates_removed", None),
         import_error=       getattr(job, "import_error", None),
@@ -625,7 +691,20 @@ def _lead_to_response(lead: Lead) -> LeadResultResponse:
         except Exception:
             pass
 
+    icp_vr = next((v for v in vrs if v.stage == "icp"), None)
+    web_data = json_object(web_vr.raw_output) if web_vr else {}
+    icp_data = json_object(icp_vr.raw_output) if icp_vr else {}
+    tracking = lead.tracking
     return LeadResultResponse(
+        reviewed=bool(tracking.reviewed) if tracking else False,
+        tracking_notes=(tracking.notes or "") if tracking else "",
+        tracking_version=tracking.version if tracking else 0,
+        reuse_kind=lead.reuse_kind,
+        reused_from_lead_id=str(lead.reused_from_lead_id) if lead.reused_from_lead_id else None,
+        icp_input=lead.job.icp_prompt,
+        icp_proofs=proof_rows(web_data, icp_data),
+        evidence_checked_at=web_data.get("checked_at") if isinstance(web_data.get("checked_at"), str) else None,
+        employment_status=web_data.get("employment_status") if web_data.get("employment_status") in ("current", "former") else "unclear",
         lead_id=        str(lead.id),
         contact_name=   lead.contact_name,
         company_name=   lead.company_name,
@@ -642,7 +721,7 @@ def _lead_to_response(lead: Lead) -> LeadResultResponse:
         growth_score=   fs.growth_score   if fs else None,
         contact_score=  fs.contact_score  if fs else None,
         validation_status=("Passed" if contact_vr.passed else "Failed") if contact_vr else "Pending",
-        source_urls=    source_urls,
+        source_urls=    clean_sources(source_urls),
         company_description=lead.company_description,
         technologies_used=  lead.technologies_used,
     )
