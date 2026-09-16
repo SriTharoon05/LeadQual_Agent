@@ -531,22 +531,25 @@ def export_csv(job_id: str, db: Session = Depends(get_db)):
     )
 
 
-# ── DELETE /jobs/{job_id} ─────────────────────────────────────────────────────
+from app.models import CompanyScrape
+
 @app.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_job(job_id: str, db: Session = Depends(get_db)):
-    """Delete a job and all associated data (cascade + Qdrant vectors)."""
     transaction_lock(db, "ql:dispatch:" + job_id)
     job = _get_job_or_404(job_id, db)
 
-    #if job.status in {"running", "importing"}:
-    #    raise HTTPException(status_code=409, detail="Wait until processing finishes before deleting this job.")
-
-    # Remove this session's vectors from Qdrant (best-effort — never block delete).
     try:
         qdrant_delete_job(job_id)
     except Exception as e:
         logger.warning(f"Failed to delete Qdrant vectors for job {job_id}: {e}")
     _delete_job_blobs(job_id)
+
+    # Bulk delete — avoids ORM's uselist=False assumption missing duplicate rows
+    db.query(CompanyScrape).filter(
+        CompanyScrape.lead_id.in_(
+            db.query(Lead.id).filter(Lead.job_id == job_id)
+        )
+    ).delete(synchronize_session=False)
 
     transaction_lock(db, "ql:lead-import")
     tracking_ids = [row[0] for row in db.query(Lead.tracking_id).filter(
@@ -559,6 +562,7 @@ def delete_job(job_id: str, db: Session = Depends(get_db)):
             ~db.query(Lead.id).filter(Lead.tracking_id == LeadTracking.id).exists(),
         ).delete(synchronize_session=False)
     logger.info(f"Job {job_id} deleted")
+
 
 @app.get("/jobs/{job_id}/token-report")
 def token_report(job_id: str, db: Session = Depends(get_db)):
