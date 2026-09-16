@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import {
   Building2, User, Mail, Award, Lightbulb, CheckSquare, Link2, Cpu, Send,
 } from 'lucide-react';
@@ -27,6 +28,7 @@ export function LeadDetailDrawer({ lead, open, onClose, jobId, onSaved }: {
 }
 
 function LeadDetailContent({ lead, jobId, onSaved }: { lead: LeadResult; jobId: string; onSaved: (lead: LeadResult) => void }) {
+  const [showAllSources, setShowAllSources] = useState(false);
   const outreach = parseOutreach(lead.outreach_intelligence);
   const radarData = [
     { metric: 'ICP',      value: numVal(lead.icp_score) },
@@ -81,9 +83,26 @@ function LeadDetailContent({ lead, jobId, onSaved }: { lead: LeadResult; jobId: 
           <span className="text-xs font-medium text-slate-500 flex items-center gap-1.5 mb-1.5"><Link2 className="h-3.5 w-3.5" />Sources</span>
           {safeArr(lead.source_urls).length > 0 ? (
             <div className="flex flex-wrap gap-2">
-              {lead.source_urls.map((url, i) => (
-                <SourceGlobe key={i} url={url} />
+              {(showAllSources ? lead.source_urls : lead.source_urls.slice(0, 2)).map((url, i) => (
+                <a
+                  key={i}
+                  href={url.startsWith('http') ? url : `https://${url}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 rounded-lg bg-sky-50 px-2.5 py-1 text-xs text-sky-700 ring-1 ring-sky-200 hover:bg-sky-100 transition-colors"
+                >
+                  <Link2 className="h-3 w-3" />
+                  {url.replace(/^https?:\/\//, '').slice(0, 40)}
+                </a>
               ))}
+              {lead.source_urls.length > 2 && (
+                <button
+                  onClick={() => setShowAllSources(!showAllSources)}
+                  className="inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2.5 py-1 text-xs text-slate-600 ring-1 ring-slate-200 hover:bg-slate-200 transition-colors"
+                >
+                  {showAllSources ? 'Show less' : `+${lead.source_urls.length - 2} more`}
+                </button>
+              )}
             </div>
           ) : (
             <p className="text-xs text-slate-400">No sources</p>
