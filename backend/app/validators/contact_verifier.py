@@ -84,6 +84,7 @@ class ContactVerifyResult:
     phone_carrier: str = ""
     phone_country: str = ""
     employment_confirmed: bool = False
+    employment_status: str = "unclear"
     contact_quality_score: float = 0.0
     raw_output: str = ""
 
@@ -97,6 +98,7 @@ class ContactVerifyResult:
             "phone_carrier":         self.phone_carrier,
             "phone_country":         self.phone_country,
             "employment_confirmed":  self.employment_confirmed,
+            "employment_status": self.employment_status,
             "contact_quality_score": self.contact_quality_score,
         }
 
@@ -138,7 +140,8 @@ def verify_contact(lead_data: dict, web_result=None) -> ContactVerifyResult:
     # ── 3. Employment cross-check ─────────────────────────────────────────────
     if web_result is not None:
         try:
-            result.employment_confirmed = bool(getattr(web_result, "person_verified", False))
+            result.employment_status = getattr(web_result, "employment_status", "unclear")
+            result.employment_confirmed = result.employment_status == "current"
         except Exception:
             result.employment_confirmed = False
 

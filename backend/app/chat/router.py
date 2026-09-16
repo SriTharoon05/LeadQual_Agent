@@ -26,10 +26,12 @@ import re
 from typing import Optional
 
 from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
 from app.models import Lead, FinalScore
+from app.utils.lead_identity import json_object
+from app.validators.evidence import proof_rows
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +167,7 @@ def _resolve_scope(db, job_id, message, history):
 # ── SQL retrieval (hardened) ──────────────────────────────────────────────────
 def _sql_context(db, job_id, company, person_tokens) -> dict:
     try:
-        base = db.query(Lead).filter(Lead.job_id == job_id)   # ← session scope
+        base = db.query(Lead).options(selectinload(Lead.validation_results)).filter(Lead.job_id == job_id)   # ← session scope
 
         if company:
             q = base.filter(Lead.company_name.ilike(f"%{company}%"))
@@ -198,6 +200,11 @@ def _sql_context(db, job_id, company, person_tokens) -> dict:
                 "linkedin":     lead.linkedin_profile_url or None,
                 "final_score":  fs.total_score if fs else None,
                 "priority":     fs.priority if fs else None,
+                "company_description": lead.company_description,
+                "qualification_reasoning": fs.reasoning if fs else None,
+                "icp_validation_proofs": proof_rows(
+                    next((json_object(v.raw_output) for v in lead.validation_results if v.stage == "web"), {}),
+                    next((json_object(v.raw_output) for v in lead.validation_results if v.stage == "icp"), {})),
             })
 
         # Session-wide aggregates (best-effort).
@@ -266,14 +273,14 @@ def _system_prompt(job_id: str) -> str:
         "Each turn you receive:\n"
         "  DATABASE_RECORDS — structured contacts: names, emails, phones, titles, "
         "company, scores, priority. AUTHORITATIVE for contact details and for "
-        "which company a person belongs to.\n"
+        "the company claimed by the upload. Current employment must come from icp_validation_proofs; an uploaded company is not proof of current employment.\n"
         "  WEBSITE_CONTEXT — scraped text about what companies do.\n\n"
         "RULES:\n"
         "- Contact details / which company a person is from / scores / priority "
         "-> use DATABASE_RECORDS. A user may misspell a name slightly; if a record "
         "clearly refers to the same person (e.g. same first name), treat it as a "
         "match.\n"
-        "- What a company does -> use WEBSITE_CONTEXT.\n"
+        "- What a company does -> use company_description or WEBSITE_CONTEXT. For ICP, employment, and company facts use icp_validation_proofs, respecting unclear/conflicting status and original check dates.\n"
         "- If DATABASE_RECORDS.truncated is true, more matches exist than shown — "
         "answer from what's given and offer to narrow down.\n"
         "- If DATABASE_RECORDS.ambiguous_person is true, the name matched many "

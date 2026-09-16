@@ -38,11 +38,16 @@ from app.config import (
     settings,
 )
 from app.models import Lead
+from app.utils.lead_identity import json_object
+from app.validators.evidence import proof_rows
 
 logger = logging.getLogger(__name__)
 
 # All output columns in order
-ALL_COLUMNS: list[str] = CANONICAL_COLUMNS + EXPORT_EXTRA_COLUMNS
+ALL_COLUMNS: list[str] = CANONICAL_COLUMNS + EXPORT_EXTRA_COLUMNS + [
+    "Reviewed", "Tracking Notes", "Reuse Type", "Reused From Lead ID", "ICP Input",
+    "Evidence Checked At", "Current Employment", "ICP Validation Proofs",
+]
 
 # Header style constants
 _HDR1_FILL  = PatternFill("solid", fgColor="1F4E79")   # dark blue — group row
@@ -88,7 +93,7 @@ def _fetch_rows(job_id: str, db: Session) -> list[dict]:
     leads = (
         db.query(Lead)
         .filter(Lead.job_id == job_id)
-        .options(joinedload(Lead.final_score), selectinload(Lead.validation_results))
+        .options(joinedload(Lead.job), joinedload(Lead.final_score), selectinload(Lead.validation_results))
         .order_by(Lead.row_index)
         .all()
     )
@@ -167,6 +172,23 @@ def _fetch_rows(job_id: str, db: Session) -> list[dict]:
 
         row["Source URLs"] = " | ".join(all_urls[:10])   # cap at 10 URLs
 
+        web = next((v for v in lead.validation_results if v.stage == "web"), None)
+        icp = next((v for v in lead.validation_results if v.stage == "icp"), None)
+        web_data = json_object(web.raw_output) if web else {}
+        proofs = proof_rows(web_data, json_object(icp.raw_output) if icp else {})
+        row.update({
+            "Reviewed": "Yes" if lead.tracking and lead.tracking.reviewed else "No",
+            "Tracking Notes": lead.tracking.notes or "" if lead.tracking else "",
+            "Reuse Type": lead.reuse_kind or "New",
+            "Reused From Lead ID": str(lead.reused_from_lead_id or ""),
+            "ICP Input": lead.job.icp_prompt or "",
+            "Evidence Checked At": web_data.get("checked_at", ""),
+            "Current Employment": web_data.get("employment_status", "unclear"),
+            "ICP Validation Proofs": "\n\n".join(
+                f"{p['label']} | ICP: {p['requirement']} | Finding: {p['value']} | {p['verdict']}\n"
+                + " | ".join(source["url"] for source in p["sources"])
+                for p in proofs) or "Evidence unavailable for this earlier result",
+        })
         rows.append(row)
 
     return rows
@@ -223,7 +245,7 @@ def _build_excel(rows: list[dict]) -> bytes:
         )
 
         for col_num, col_name in enumerate(ALL_COLUMNS, start=1):
-            cell = ws.cell(row=row_num, column=col_num, value=row_data.get(col_name, ""))
+            cell = ws.cell(row=row_num, column=col_num, value=_safe_cell(row_data.get(col_name, "")))
             if row_fill:
                 cell.fill = row_fill
 
@@ -234,6 +256,7 @@ def _build_excel(rows: list[dict]) -> bytes:
         "Technologies Used": 40, "Reasoning": 55, "Growth Signals": 45,
         "Outreach Intelligence": 60,
         "Source URLs": 60,
+        "Tracking Notes": 45, "ICP Input": 55, "ICP Validation Proofs": 70,
     }
     default_width = 18
     for col_num, col_name in enumerate(ALL_COLUMNS, start=1):
@@ -255,7 +278,7 @@ def _build_csv(rows: list[dict]) -> bytes:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=ALL_COLUMNS, extrasaction="ignore")
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows({key: _safe_cell(value) for key, value in row.items()} for row in rows)
     return buf.getvalue().encode("utf-8-sig")   # BOM for Excel compatibility
 
 
@@ -329,3 +352,13 @@ def _fmt_score(v: Optional[float]) -> str:
     if v is None:
         return ""
     return f"{v:.1f}"
+
+
+def _safe_cell(value):
+    """Keep user-authored notes and uploaded values as text, never formulas."""
+    if isinstance(value, str):
+        # XML 1.0 cannot encode these controls in an XLSX cell.
+        value = "".join(c for c in value if c in "\n\r\t" or ord(c) >= 32)
+        if value.lstrip().startswith(("=", "+", "-", "@")):
+            return "'" + value
+    return value

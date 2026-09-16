@@ -31,6 +31,9 @@ export interface IcpResponse {
 }
 
 export interface JobStatusResponse {
+  reused_rows: number;
+  research_reused_rows: number;
+  icp_prompt?: string | null;
   job_id:             string;
   status:             JobStatus;
   file_name?:         string | null;
@@ -69,6 +72,15 @@ export interface DashboardStatsResponse {
 
 // ── Lead ────────────────────────────────────────────────────────────────────
 export interface LeadResult {
+  reviewed: boolean;
+  tracking_notes: string;
+  tracking_version: number;
+  reuse_kind: 'full' | 'research' | null;
+  reused_from_lead_id: string | null;
+  icp_input: string | null;
+  icp_proofs: IcpProof[];
+  evidence_checked_at: string | null;
+  employment_status: 'current' | 'former' | 'unclear';
   lead_id: string;
   contact_name: string | null;
   company_name: string | null;
@@ -88,6 +100,19 @@ export interface LeadResult {
   source_urls: string[];
   company_description: string | null;
   technologies_used: string | null;
+}
+
+export interface IcpProof {
+  field: string;
+  label: string;
+  value: string;
+  status: 'confirmed' | 'unclear' | 'conflicting';
+  explanation: string;
+  requirement: string;
+  verdict: 'match' | 'mismatch' | 'unclear' | 'not_specified';
+  reasoning: string;
+  checked_at: string | null;
+  sources: { url: string; title: string; excerpt: string }[];
 }
 
 // ── Chat ────────────────────────────────────────────────────────────────────

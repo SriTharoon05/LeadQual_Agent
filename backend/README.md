@@ -2,6 +2,9 @@
 
 FastAPI accepts uploads and serves job/results APIs. Celery performs imports, lead qualification, web research, scoring, outreach generation, and embeddings asynchronously.
 
+For database result reuse, shared tracking, ICP evidence, and the required migration,
+see [the release and rollout guide](RELEASE_LEAD_REUSE.md).
+
 Start locally after configuring `.env`:
 
 ```powershell

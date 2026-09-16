@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import {
   Building2, User, Mail, Award, Lightbulb, CheckSquare, Link2, Cpu, Send,
 } from 'lucide-react';
@@ -9,20 +10,25 @@ import { Modal } from '@/components/ui/Modal';
 import { Badge, PriorityBadge } from '@/components/ui/Badge';
 import { dash, num, safeArr, numVal } from '@/lib/format';
 import type { LeadResult } from '@/types';
+import { IcpEvidence, SourceGlobe } from './IcpEvidence';
+import { LeadTracking } from './LeadTracking';
 
-export function LeadDetailDrawer({ lead, open, onClose }: {
+export function LeadDetailDrawer({ lead, open, onClose, jobId, onSaved }: {
+  jobId: string;
+  onSaved: (lead: LeadResult) => void;
   lead: LeadResult | null;
   open: boolean;
   onClose: () => void;
 }) {
   return (
     <Modal open={open} onClose={onClose} size="xl" title="Lead Detail">
-      {lead && <LeadDetailContent lead={lead} />}
+      {lead && <LeadDetailContent key={lead.lead_id} lead={lead} jobId={jobId} onSaved={onSaved} />}
     </Modal>
   );
 }
 
-function LeadDetailContent({ lead }: { lead: LeadResult }) {
+function LeadDetailContent({ lead, jobId, onSaved }: { lead: LeadResult; jobId: string; onSaved: (lead: LeadResult) => void }) {
+  const [showAllSources, setShowAllSources] = useState(false);
   const outreach = parseOutreach(lead.outreach_intelligence);
   const radarData = [
     { metric: 'ICP',      value: numVal(lead.icp_score) },
@@ -77,7 +83,7 @@ function LeadDetailContent({ lead }: { lead: LeadResult }) {
           <span className="text-xs font-medium text-slate-500 flex items-center gap-1.5 mb-1.5"><Link2 className="h-3.5 w-3.5" />Sources</span>
           {safeArr(lead.source_urls).length > 0 ? (
             <div className="flex flex-wrap gap-2">
-              {lead.source_urls.map((url, i) => (
+              {(showAllSources ? lead.source_urls : lead.source_urls.slice(0, 2)).map((url, i) => (
                 <a
                   key={i}
                   href={url.startsWith('http') ? url : `https://${url}`}
@@ -89,6 +95,14 @@ function LeadDetailContent({ lead }: { lead: LeadResult }) {
                   {url.replace(/^https?:\/\//, '').slice(0, 40)}
                 </a>
               ))}
+              {lead.source_urls.length > 2 && (
+                <button
+                  onClick={() => setShowAllSources(!showAllSources)}
+                  className="inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2.5 py-1 text-xs text-slate-600 ring-1 ring-slate-200 hover:bg-slate-200 transition-colors"
+                >
+                  {showAllSources ? 'Show less' : `+${lead.source_urls.length - 2} more`}
+                </button>
+              )}
             </div>
           ) : (
             <p className="text-xs text-slate-400">No sources</p>
@@ -132,12 +146,14 @@ function LeadDetailContent({ lead }: { lead: LeadResult }) {
         )}
       </Section>
 
-      {/* Reasoning */}
-      {lead.reasoning && (
-        <Section icon={<Lightbulb className="h-4 w-4" />} title="AI Reasoning">
-          <p className="text-sm text-slate-600 leading-relaxed">{lead.reasoning}</p>
-        </Section>
-      )}
+      <Section icon={<CheckSquare className="h-4 w-4" />} title="Lead tracking">
+        <LeadTracking lead={lead} jobId={jobId} onSaved={onSaved} notes />
+      </Section>
+
+      <Section icon={<Lightbulb className="h-4 w-4" />} title="AI Reasoning">
+        {lead.reuse_kind && <p className="mb-3 rounded-lg bg-sky-50 p-2 text-xs text-sky-800">{lead.reuse_kind === 'full' ? 'Saved result reused from an earlier upload.' : 'Saved research reused; qualification recalculated for this upload.'}</p>}
+        <IcpEvidence lead={lead} />
+      </Section>
 
       {/* Growth signals */}
       {lead.growth_signals && (

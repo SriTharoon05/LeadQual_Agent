@@ -14,7 +14,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Boolean, DateTime, Float, ForeignKey,
-    Integer, String, Text, func,
+    Integer, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -38,6 +38,8 @@ class Job(Base):
     total_rows: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     processed_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reused_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    research_reused_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     icp_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     file_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
@@ -113,6 +115,16 @@ class LLMCallLog(Base):
                 f"job={self.job_id}>")
 
 # ── leads ─────────────────────────────────────────────────────────────────────
+class LeadTracking(Base):
+    """Shared manual tracking, independent of a particular upload/job."""
+    __tablename__ = "lead_tracking"
+    id: Mapped[str] = mapped_column(UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid)
+    reviewed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class Lead(Base):
     __tablename__ = "leads"
 
@@ -123,6 +135,17 @@ class Lead(Base):
         UNIQUEIDENTIFIER, ForeignKey("jobs.id"), nullable=False
     )
     row_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tracking_id: Mapped[Optional[str]] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("lead_tracking.id"), nullable=True, index=True)
+    crm_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    email_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    linkedin_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    person_company_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    input_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    research_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    reused_from_lead_id: Mapped[Optional[str]] = mapped_column(UNIQUEIDENTIFIER, nullable=True)
+    reuse_kind: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    tracking: Mapped[Optional["LeadTracking"]] = relationship(lazy="joined")
 
     # ── Contact Information (cols 1–8) ────────────────────────────────────────
     contact_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -195,6 +218,7 @@ class Lead(Base):
 # ── validation_results ────────────────────────────────────────────────────────
 class ValidationResult(Base):
     __tablename__ = "validation_results"
+    __table_args__ = (UniqueConstraint("lead_id", "stage", name="uq_validation_lead_stage"),)
 
     id: Mapped[str] = mapped_column(
         UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
@@ -225,6 +249,7 @@ class ValidationResult(Base):
 # ── final_scores ──────────────────────────────────────────────────────────────
 class FinalScore(Base):
     __tablename__ = "final_scores"
+    __table_args__ = (UniqueConstraint("lead_id", name="uq_final_score_lead"),)
 
     id: Mapped[str] = mapped_column(
         UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid

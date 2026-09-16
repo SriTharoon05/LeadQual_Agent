@@ -1,5 +1,6 @@
 from urllib.parse import quote_plus
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Dict, List, Tuple
 
@@ -11,6 +12,7 @@ class Settings(BaseSettings):
     AZURE_OPENAI_ENDPOINT: str
     AZURE_OPENAI_API_VERSION: str = "2025-03-01-preview"
     AZURE_OPENAI_DEPLOYMENT: str = "gpt-4.1-mini"
+    LLM_TIMEOUT_SECONDS: float = Field(default=120.0, gt=0, le=600)
 
     # ── Azure SQL ─────────────────────────────────────────────────────────────
     AZURE_SQL_SERVER: str
