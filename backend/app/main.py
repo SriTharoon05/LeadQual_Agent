@@ -538,8 +538,8 @@ def delete_job(job_id: str, db: Session = Depends(get_db)):
     transaction_lock(db, "ql:dispatch:" + job_id)
     job = _get_job_or_404(job_id, db)
 
-    if job.status in {"running", "importing"}:
-        raise HTTPException(status_code=409, detail="Wait until processing finishes before deleting this job.")
+    #if job.status in {"running", "importing"}:
+    #    raise HTTPException(status_code=409, detail="Wait until processing finishes before deleting this job.")
 
     # Remove this session's vectors from Qdrant (best-effort — never block delete).
     try:
