@@ -57,8 +57,9 @@ The lead detail panel displays ICP input, proof cards, globe links, and the
 qualification summary. Excel/CSV exports include tracking and evidence. Formula
 prefixes in imported values/notes are escaped in exports. The chatbot receives
 saved descriptions and proof data through job-scoped SQL retrieval, so it can
-answer about reused leads without creating new website embeddings. Existing
-semantic website retrieval still supplements newly processed leads.
+answer about reused leads without creating new website embeddings. The later
+[chat reliability release](RELEASE_CHAT_RELIABILITY.md) uses SQL research context
+and removes the embedding dependency from chatbot requests.
 
 ## Database migration and rollout
 

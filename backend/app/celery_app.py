@@ -50,7 +50,8 @@ celery = Celery(
     "ailead",
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL,
-    include=["app.tasks.tasks", "app.tasks.embed_task", "app.tasks.import_task"],
+    include=["app.tasks.tasks", "app.tasks.embed_task", "app.tasks.import_task",
+             "app.tasks.refresh_task"],
 )
 
 # Concurrency from .env (MAX_WORKERS). CLI --concurrency still overrides this.
@@ -75,6 +76,7 @@ celery.conf.update(
         "app.tasks.tasks.*":      {"queue": CELERY_QUEUE_NAME},
         "app.tasks.import_task.*": {"queue": settings.CELERY_IMPORT_QUEUE},
         "app.tasks.embed_task.*": {"queue": settings.CELERY_EMBED_QUEUE},
+        "app.tasks.refresh_task.*": {"queue": CELERY_QUEUE_NAME},
     },
 
     # Worker behaviour — threads pool suits this I/O-bound pipeline.
@@ -91,6 +93,9 @@ celery.conf.update(
     # Retry defaults (overridden per-task where needed)
     task_max_retries=3,
     task_default_retry_delay=30,         # seconds
+    # Bound failed publish calls made by refresh polling/recovery.
+    broker_connection_timeout=5,
+    broker_transport_options={"socket_connect_timeout": 5, "socket_timeout": 5},
 )
 
 

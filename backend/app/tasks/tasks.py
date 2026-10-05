@@ -33,7 +33,10 @@ import redis
 from app.validators.web_researcher import WebResearchResult
 _web_cache_lock = threading.Lock()
 _web_research_cache: dict[str, object] = {}
-_redis_cache = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+_redis_cache = redis.Redis.from_url(
+    settings.REDIS_URL, decode_responses=True,
+    socket_connect_timeout=3, socket_timeout=3,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -194,6 +197,8 @@ def _process_lead(self, db, lead_id, icp_prompt):
                          score=_web_score(web_result),
                          passed=bool(getattr(web_result, "company_verified", False)),
                          sources=getattr(web_result, "sources", None))
+        if not json_object(web_result.raw_output).get("error"):
+            lead.evidence_checked_at = _research_checked_at(web_result.checked_at)
         db.commit()
 
         lead.company_description = getattr(web_result, "company_description", "") or ""
@@ -496,6 +501,17 @@ def _get_cached_web(key: str):
         logger.debug("Redis web cache read unavailable: %s", exc)
     with _web_cache_lock:
         return _web_research_cache.get(key)
+
+
+def _research_checked_at(value):
+    """Preserve the search's actual check time when saved research is reused."""
+    try:
+        checked = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if checked.tzinfo is None:
+            checked = checked.replace(tzinfo=timezone.utc)
+        return checked.astimezone(timezone.utc).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
 
 
 def _set_cached_web(key: str, result) -> None:

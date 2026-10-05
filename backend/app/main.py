@@ -21,10 +21,10 @@ Start with:
 """
 
 import io
-import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
+from uuid import UUID
 
 from azure.storage.blob import BlobServiceClient
 from celery import chord
@@ -34,15 +34,18 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import case, func, or_, update
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.config import settings, SUPPORTED_EXTENSIONS
 from app.database import get_db, ping_db, schema_ready
-from app.models import Job, Lead, FinalScore, ValidationResult, AdminUser, LeadTracking
-from app.utils.lead_identity import json_object, transaction_lock
-from app.validators.evidence import proof_rows, clean_sources
+from app.models import Job, Lead, FinalScore, AdminUser, LeadTracking, TeamMember, LeadRefresh
+from app.lead_results import LeadResultResponse, lead_to_response as _lead_to_response
+from app.workspace.routes import router as workspace_router
+from app.workspace.filters import LeadFilters, filtered_query
+from app.refresh import router as refresh_router
+from app.utils.lead_identity import transaction_lock
 from app.export.result_builder import build_excel_bytes, build_csv_bytes
 from app.tasks.tasks import process_lead, finalise_job
 from app.chat.routes import router as chat_router
@@ -59,6 +62,8 @@ app = FastAPI(
     version="1.0.0",
 )
 app.include_router(chat_router)
+app.include_router(workspace_router)
+app.include_router(refresh_router)
 
 app.add_middleware(AuthenticationMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -113,37 +118,6 @@ class JobStatusResponse(BaseModel):
     completion_tokens: Optional[int] = None
 
 
-class LeadResultResponse(BaseModel):
-    lead_id:        str
-    reviewed: bool = False
-    tracking_notes: str = ""
-    tracking_version: int = 0
-    reuse_kind: Optional[str] = None
-    reused_from_lead_id: Optional[str] = None
-    icp_input: Optional[str] = None
-    icp_proofs: list[dict] = Field(default_factory=list)
-    evidence_checked_at: Optional[str] = None
-    employment_status: str = "unclear"
-    contact_name:   Optional[str] = None
-    company_name:   Optional[str] = None
-    job_title:      Optional[str] = None
-    email_address:  Optional[str] = None
-    final_score:    Optional[float] = None
-    priority:       Optional[str] = None
-    reasoning:      Optional[str] = None
-    growth_signals: Optional[str] = None
-    outreach_intelligence: Optional[str] = None
-    icp_score:      Optional[float] = None
-    authority_score: Optional[float] = None
-    data_score:     Optional[float] = None
-    growth_score:   Optional[float] = None
-    contact_score:  Optional[float] = None
-    validation_status: Optional[str] = None
-    source_urls:    list[str] = Field(default_factory=list)
-    company_description: Optional[str] = None
-    technologies_used:   Optional[str] = None
-
-
 class PaginatedResults(BaseModel):
     """Wrapper for paginated /results — gives the frontend total + page info."""
     items:       list[LeadResultResponse]
@@ -155,9 +129,29 @@ class PaginatedResults(BaseModel):
 
 
 class TrackingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     version: int = Field(ge=0)
     reviewed: Optional[bool] = None
     notes: Optional[str] = Field(default=None, max_length=10000)
+    owner_id: UUID | None = None
+    follow_up_at: datetime | None = None
+    follow_up_note: str | None = Field(default=None, max_length=10000)
+    follow_up_completed: bool | None = None
+
+    @field_validator("follow_up_at")
+    @classmethod
+    def validate_follow_up_time(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError("Follow-up time must include its timezone.")
+        try:
+            checked = value.astimezone(timezone.utc)
+            if checked.year < 1753 or checked > datetime(9999, 12, 31, 23, 59, 59, 997000, tzinfo=timezone.utc):
+                raise ValueError("Follow-up time must be within the supported calendar range.")
+        except OverflowError as exc:
+            raise ValueError("Follow-up time must be within the supported calendar range.") from exc
+        return value
 
 
 class UploadResponse(BaseModel):
@@ -275,7 +269,7 @@ async def upload_file(
 # ── POST /jobs/{job_id}/icp ───────────────────────────────────────────────────
 @app.post("/jobs/{job_id}/icp", status_code=status.HTTP_202_ACCEPTED)
 def submit_icp(
-    job_id:  str,
+    job_id:  UUID,
     body:    ICPRequest,
     db:      Session = Depends(get_db),
 ):
@@ -283,6 +277,7 @@ def submit_icp(
     Attach an ICP prompt to a job and dispatch all Celery tasks.
     Returns immediately — frontend polls /jobs/{job_id}/status.
     """
+    job_id = str(job_id)
     transaction_lock(db, "ql:dispatch:" + job_id)
     job: Job = _get_job_or_404(job_id, db)
 
@@ -390,6 +385,14 @@ def job_results(
     offset: int = Query(0,  ge=0,          description="Rows to skip (page offset)."),
     search: Optional[str] = Query(None, max_length=100),
     priority: Optional[Literal["High", "Medium", "Low"]] = None,
+    owner_id: UUID | None = None,
+    unassigned: bool = False,
+    reviewed: bool | None = None,
+    follow_up: Literal["all", "due", "upcoming", "completed", "unscheduled"] = "all",
+    country: str | None = Query(None, max_length=100),
+    industry: str | None = Query(None, max_length=100),
+    min_score: float | None = Query(None, ge=0, le=100),
+    evidence: Literal["all", "fresh", "stale", "unknown"] = "all",
     sort_by: Literal["row_index", "company_name", "contact_name", "email_address", "final_score", "priority"] = "row_index",
     sort_dir: Literal["asc", "desc"] = "asc",
     db:     Session = Depends(get_db),
@@ -406,16 +409,14 @@ def job_results(
     """
     _get_job_or_404(job_id, db)
 
-    base = db.query(Lead).outerjoin(FinalScore, FinalScore.lead_id == Lead.id).filter(Lead.job_id == job_id)
-    if search and search.strip():
-        escaped = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        term = f"%{escaped}%"
-        base = base.filter(or_(
-            Lead.company_name.ilike(term, escape="\\"), Lead.contact_name.ilike(term, escape="\\"),
-            Lead.email_address.ilike(term, escape="\\"),
-        ))
-    if priority:
-        base = base.filter(FinalScore.priority == priority)
+    try:
+        filters = LeadFilters(search=search or "", priority=priority, owner_id=owner_id,
+                              unassigned=unassigned, reviewed=reviewed, follow_up=follow_up,
+                              country=country or "", industry=industry or "",
+                              min_score=min_score, evidence=evidence)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail="Invalid lead filters.") from exc
+    base = filtered_query(db, filters, datetime.now(timezone.utc)).filter(Lead.job_id == job_id)
 
     # Total count for the whole job (cheap COUNT query, no row hydration).
     total = base.with_entities(func.count(Lead.id)).scalar() or 0
@@ -436,7 +437,7 @@ def job_results(
             joinedload(Lead.job), joinedload(Lead.final_score),           # 1-to-1 → JOIN in the same query
             selectinload(Lead.validation_results),  # 1-to-many → one extra IN() query
         )
-        .order_by(order, Lead.row_index.asc())
+        .order_by(order, Lead.row_index.asc(), Lead.id.asc())
         .offset(offset)
         .limit(limit)
         .all()
@@ -483,14 +484,37 @@ def update_tracking(job_id: str, lead_id: str, body: TrackingUpdate,
     if not lead.tracking_id:
         raise HTTPException(status_code=409, detail="Lead tracking requires the database migration")
     changes = {}
-    for field, column in (("reviewed", "reviewed"), ("notes", "notes")):
+    for field, column in (("reviewed", "reviewed"), ("notes", "notes"), ("follow_up_note", "follow_up_note")):
         if field in body.model_fields_set:
             value = getattr(body, field)
             if value is None:
                 raise HTTPException(status_code=422, detail=f"{field} cannot be null")
             changes[column] = value
+    if "owner_id" in body.model_fields_set:
+        transaction_lock(db, "ql:workspace:team")
+        if body.owner_id:
+            member = db.get(TeamMember, str(body.owner_id), populate_existing=True)
+            unchanged = str(body.owner_id) == str(lead.tracking.owner_id)
+            if not member or (not member.active and not unchanged):
+                raise HTTPException(status_code=422, detail="Choose an active team member, or unassign this lead.")
+        changes["owner_id"] = str(body.owner_id) if body.owner_id else None
+    if "follow_up_at" in body.model_fields_set:
+        due = body.follow_up_at
+        if due and due.tzinfo is None:
+            raise HTTPException(status_code=422, detail="Follow-up time must include its timezone.")
+        changes["follow_up_at"] = due.astimezone(timezone.utc).replace(tzinfo=None) if due else None
+        changes["follow_up_completed_at"] = None
+        if not due:
+            changes["follow_up_note"] = ""
+    if "follow_up_completed" in body.model_fields_set:
+        if body.follow_up_completed is None:
+            raise HTTPException(status_code=422, detail="Follow-up completion cannot be null.")
+        scheduled = changes.get("follow_up_at", lead.tracking.follow_up_at)
+        if body.follow_up_completed and not scheduled:
+            raise HTTPException(status_code=422, detail="Schedule a follow-up before marking it complete.")
+        changes["follow_up_completed_at"] = datetime.now(timezone.utc).replace(tzinfo=None) if body.follow_up_completed else None
     if not changes:
-        raise HTTPException(status_code=422, detail="Provide reviewed or notes")
+        raise HTTPException(status_code=422, detail="Provide a tracking, owner, or follow-up change.")
     changes.update(version=LeadTracking.version + 1, updated_at=datetime.now(timezone.utc).replace(tzinfo=None))
     result = db.execute(update(LeadTracking).where(
         LeadTracking.id == lead.tracking_id, LeadTracking.version == body.version
@@ -534,9 +558,15 @@ def export_csv(job_id: str, db: Session = Depends(get_db)):
 from app.models import CompanyScrape
 
 @app.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_job(job_id: str, db: Session = Depends(get_db)):
+def delete_job(job_id: UUID, db: Session = Depends(get_db)):
+    job_id = str(job_id)
     transaction_lock(db, "ql:dispatch:" + job_id)
     job = _get_job_or_404(job_id, db)
+    if job.status in ("running", "importing"):
+        raise HTTPException(status_code=409, detail="Wait for this upload to finish before deleting it.")
+    if db.query(LeadRefresh.id).join(Lead, Lead.id == LeadRefresh.lead_id).filter(
+            Lead.job_id == job_id, LeadRefresh.status.in_(("queued", "running"))).first():
+        raise HTTPException(status_code=409, detail="Wait for the active evidence refresh to finish before deleting this upload.")
 
     try:
         qdrant_delete_job(job_id)
@@ -678,56 +708,6 @@ def _job_to_status(job: Job) -> JobStatusResponse:
         total_tokens_used=  getattr(job, "total_tokens_used", None),
         prompt_tokens=      getattr(job, "prompt_tokens", None),
         completion_tokens=  getattr(job, "completion_tokens", None),
-    )
-
-
-def _lead_to_response(lead: Lead) -> LeadResultResponse:
-    fs:   Optional[FinalScore]   = lead.final_score
-    vrs:  list[ValidationResult] = lead.validation_results or []
-
-    contact_vr = next((v for v in vrs if v.stage == "contact"), None)
-    web_vr     = next((v for v in vrs if v.stage == "web"), None)
-
-    source_urls: list[str] = []
-    if web_vr and web_vr.sources_json:
-        try:
-            source_urls = json.loads(web_vr.sources_json)
-        except Exception:
-            pass
-
-    icp_vr = next((v for v in vrs if v.stage == "icp"), None)
-    web_data = json_object(web_vr.raw_output) if web_vr else {}
-    icp_data = json_object(icp_vr.raw_output) if icp_vr else {}
-    tracking = lead.tracking
-    return LeadResultResponse(
-        reviewed=bool(tracking.reviewed) if tracking else False,
-        tracking_notes=(tracking.notes or "") if tracking else "",
-        tracking_version=tracking.version if tracking else 0,
-        reuse_kind=lead.reuse_kind,
-        reused_from_lead_id=str(lead.reused_from_lead_id) if lead.reused_from_lead_id else None,
-        icp_input=lead.job.icp_prompt,
-        icp_proofs=proof_rows(web_data, icp_data),
-        evidence_checked_at=web_data.get("checked_at") if isinstance(web_data.get("checked_at"), str) else None,
-        employment_status=web_data.get("employment_status") if web_data.get("employment_status") in ("current", "former") else "unclear",
-        lead_id=        str(lead.id),
-        contact_name=   lead.contact_name,
-        company_name=   lead.company_name,
-        job_title=      lead.job_title,
-        email_address=  lead.email_address,
-        final_score=    fs.total_score    if fs else None,
-        priority=       fs.priority       if fs else None,
-        reasoning=      fs.reasoning      if fs else None,
-        growth_signals= fs.growth_signals if fs else None,
-        outreach_intelligence=fs.outreach_intelligence if fs else None,
-        icp_score=      fs.icp_score      if fs else None,
-        authority_score=fs.authority_score if fs else None,
-        data_score=     fs.data_score     if fs else None,
-        growth_score=   fs.growth_score   if fs else None,
-        contact_score=  fs.contact_score  if fs else None,
-        validation_status=("Passed" if contact_vr.passed else "Failed") if contact_vr else "Pending",
-        source_urls=    clean_sources(source_urls),
-        company_description=lead.company_description,
-        technologies_used=  lead.technologies_used,
     )
 
 

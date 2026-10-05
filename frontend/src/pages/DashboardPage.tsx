@@ -17,6 +17,9 @@ import { fmtDate, numVal, safeArr } from '@/lib/format';
 import type { JobSummary } from '@/types';
 import { useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
+import { FollowUpReminders } from '@/components/FollowUpReminders';
+import { TeamDirectory } from '@/components/TeamDirectory';
+import { invalidateLeadWorkspace } from '@/lib/workspace';
 
 export function DashboardPage() {
   const { stats, isLoading } = useDashboardStats();
@@ -39,6 +42,7 @@ export function DashboardPage() {
       toast('Job deleted', 'success');
       qc.invalidateQueries({ queryKey: ['jobs'] });
       qc.invalidateQueries({ queryKey: ['dashboard-stats'] });
+      void invalidateLeadWorkspace(qc);
     } catch {
       toast('Failed to delete job', 'error');
     }
@@ -73,9 +77,9 @@ export function DashboardPage() {
             <h1 className="text-2xl font-bold text-slate-800">Dashboard</h1>
             <p className="text-sm text-slate-500 mt-1">Overview of your lead qualification pipeline</p>
           </div>
-          <Link to="/upload">
+          <div className="flex gap-2"><Link to="/leads"><Button variant="outline" icon={<Users className="h-4 w-4" />}>Lead workspace</Button></Link><Link to="/upload">
             <Button icon={<Upload className="h-4 w-4" />}>New Upload</Button>
-          </Link>
+          </Link></div>
         </div>
 
         {/* KPI cards */}
@@ -103,8 +107,8 @@ export function DashboardPage() {
               })}
         </div>
 
-        {/* Charts */}
-
+        <FollowUpReminders />
+        <TeamDirectory />
 
         {/* Jobs table */}
         <Card className="overflow-hidden">

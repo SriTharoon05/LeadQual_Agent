@@ -104,6 +104,57 @@ def db_session() -> Generator[Session, None, None]:
 
 # ── Health check ──────────────────────────────────────────────────────────────
 @contextmanager
+def locked_chat_session(conversation_id: str):
+    """Serialize each conversation across API workers without long transactions.
+
+    The connection remains dedicated until the session lock is released. Reads
+    can commit before AI waits while the lock prevents interleaved chat turns.
+    """
+    with engine.connect() as connection:
+        db = Session(bind=connection, expire_on_commit=False)
+        acquired = False
+        resource = "ql:chat:" + conversation_id
+        try:
+            if connection.dialect.name == "mssql":
+                result = connection.execute(text("""
+                    SET NOCOUNT ON;
+                    DECLARE @result int;
+                    EXEC @result = sp_getapplock @Resource=:resource,
+                        @LockMode='Exclusive', @LockOwner='Session', @LockTimeout=2000;
+                    SELECT @result;
+                """), {"resource": resource}).scalar()
+                if result is None or result < 0:
+                    connection.rollback()
+                    raise TimeoutError("A reply is already being prepared for this conversation")
+                acquired = True
+                connection.commit()
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+            if acquired:
+                try:
+                    result = connection.execute(text("""
+                        SET NOCOUNT ON;
+                        DECLARE @result int;
+                        EXEC @result = sp_releaseapplock @Resource=:resource, @LockOwner='Session';
+                        SELECT @result;
+                    """), {"resource": resource}).scalar()
+                    connection.commit()
+                    if result is None or result < 0:
+                        connection.invalidate()
+                except Exception:
+                    connection.invalidate()
+            elif connection.dialect.name == "mssql":
+                # Lock acquisition could fail after the server acquired it but
+                # before the client received its result. Do not pool that socket.
+                connection.invalidate()
+
+
+@contextmanager
 def locked_lead_session(lead_id: str):
     """A SQL session lock survives stage commits and serializes matching leads.
 
@@ -166,13 +217,49 @@ def schema_ready() -> bool:
                 SELECT TOP 0 l.tracking_id, l.crm_key, l.email_key, l.linkedin_key,
                     l.person_company_key, l.input_fingerprint, l.research_fingerprint,
                     l.reused_from_lead_id, l.reuse_kind, t.reviewed, t.notes, t.version,
-                    j.reused_rows, j.research_reused_rows
+                    j.reused_rows, j.research_reused_rows, l.evidence_checked_at,
+                    t.owner_id, t.follow_up_at, t.follow_up_note, t.follow_up_completed_at
                 FROM leads l JOIN lead_tracking t ON t.id=l.tracking_id
                 JOIN jobs j ON j.id=l.job_id
             """))
             if conn.execute(text("SELECT TOP 1 id FROM leads WHERE tracking_id IS NULL")).first():
                 return False
+            conn.execute(text("""
+                SELECT TOP 0 id, name, email, active, version, created_at, updated_at FROM team_member
+            """))
+            conn.execute(text("""
+                SELECT TOP 0 id, name, filters_json, version, created_at, updated_at FROM saved_segment
+            """))
+            conn.execute(text("""
+                SELECT TOP 0 id, lead_id, status, requested_by, created_at, started_at,
+                    finished_at, error_message, attempt_count, last_dispatched_at,
+                    previous_snapshot_json FROM lead_refresh
+            """))
+            if conn.execute(text("""
+                SELECT COUNT(*) FROM sys.indexes
+                WHERE object_id=OBJECT_ID('lead_refresh') AND is_unique=1 AND has_filter=1
+                    AND name='uq_lead_refresh_active'
+            """)).scalar() != 1:
+                return False
+            conn.execute(text("""
+                SELECT TOP 0 m.conversation_id, m.request_id, m.[sequence],
+                    m.tool_used, m.sources_json, m.metadata_json, c.next_sequence
+                FROM chat_message m JOIN chat_conversation c ON c.id=m.conversation_id
+            """))
+            if conn.execute(text("""
+                SELECT TOP 1 m.id FROM chat_message m
+                LEFT JOIN chat_conversation c ON c.id=m.conversation_id
+                WHERE m.conversation_id IS NULL OR m.request_id IS NULL
+                    OR m.[sequence] IS NULL OR c.id IS NULL OR c.job_id <> m.job_id
+            """)).first():
+                return False
+            if conn.execute(text("""
+                SELECT COUNT(*) FROM sys.indexes
+                WHERE object_id=OBJECT_ID('chat_message') AND is_unique=1
+                    AND name IN ('uq_chat_conversation_sequence', 'uq_chat_request_role')
+            """)).scalar() != 2:
+                return False
         return True
     except Exception:
-        logger.warning("Lead reuse schema is not ready; run scripts/migrate_lead_reuse.py")
+        logger.warning("Schema is not ready; apply the lead reuse, chat reliability and team workflow migrations")
         return False

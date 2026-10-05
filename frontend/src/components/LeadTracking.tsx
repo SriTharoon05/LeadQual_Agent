@@ -1,19 +1,22 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { isAxiosError } from 'axios';
 import { useQueryClient } from '@tanstack/react-query';
 import { updateLeadTracking, getLeadDetail } from '@/api/endpoints';
 import { useToast } from '@/components/ui/Toast';
 import type { LeadResult } from '@/types';
+import { invalidateLeadWorkspace } from '@/lib/workspace';
 
 type Props = { lead: LeadResult; jobId: string; onSaved: (lead: LeadResult) => void; notes?: boolean };
 
 export function LeadTracking({ lead, jobId, onSaved, notes = false }: Props) {
   const [draft, setDraft] = useState(lead.tracking_notes || '');
+  const [notesDirty, setNotesDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [pendingReviewed, setPendingReviewed] = useState<boolean | null>(null);
   const [error, setError] = useState('');
   const qc = useQueryClient();
   const { toast } = useToast();
+  useEffect(() => { if (!notesDirty) setDraft(lead.tracking_notes || ''); }, [lead.tracking_notes, notesDirty]);
   const save = async (changes: { reviewed?: boolean; notes?: string }) => {
     if (saving) return;
     if (changes.reviewed !== undefined) setPendingReviewed(changes.reviewed);
@@ -21,7 +24,8 @@ export function LeadTracking({ lead, jobId, onSaved, notes = false }: Props) {
     try {
       const result = await updateLeadTracking(jobId, lead.lead_id, { version: lead.tracking_version, ...changes });
       onSaved(result);
-      await qc.invalidateQueries({ queryKey: ['job-results'] });
+      if (changes.notes !== undefined) setNotesDirty(false);
+      await invalidateLeadWorkspace(qc);
       if (changes.notes !== undefined) toast('Notes saved', 'success');
     } catch (cause) {
       const conflict = isAxiosError(cause) && cause.response?.status === 409;
@@ -30,7 +34,7 @@ export function LeadTracking({ lead, jobId, onSaved, notes = false }: Props) {
       toast(message, 'error');
       if (conflict) {
         try { onSaved(await getLeadDetail(jobId, lead.lead_id)); } catch { /* keep draft */ }
-        await qc.invalidateQueries({ queryKey: ['job-results'] });
+        await invalidateLeadWorkspace(qc);
       }
     } finally { setSaving(false); setPendingReviewed(null); }
   };
@@ -45,7 +49,7 @@ export function LeadTracking({ lead, jobId, onSaved, notes = false }: Props) {
     {notes && <>
       <label className="block text-xs font-medium text-slate-500" htmlFor={`notes-${lead.lead_id}`}>Tracking notes · shared across uploads</label>
       <textarea id={`notes-${lead.lead_id}`} value={draft} maxLength={10000} disabled={saving}
-        onChange={(event) => setDraft(event.target.value)} rows={4}
+        onChange={(event) => { setDraft(event.target.value); setNotesDirty(true); }} rows={4}
         placeholder="Add follow-up notes, context, or next steps…"
         className="w-full rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-700 focus:border-brand-400 focus:outline-none focus:ring-2 focus:ring-brand-100" />
       <div className="flex items-center justify-between gap-2">

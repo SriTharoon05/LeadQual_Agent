@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.database import engine
-from app.models import Lead, LeadTracking
+from app.models import Lead, LeadTracking, TeamMember
 from app.utils.lead_identity import assign_identity
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
@@ -41,6 +41,7 @@ def migrate():
             "SELECT TOP 1 id FROM jobs WHERE status IN ('running', 'importing')"
         )).first():
             raise RuntimeError("Let active jobs finish and stop API/workers before migrating.")
+        TeamMember.__table__.create(connection, checkfirst=True)
         LeadTracking.__table__.create(connection, checkfirst=True)
         columns = {column["name"] for column in inspect(connection).get_columns("leads")}
         for name, ddl in LEAD_COLUMNS.items():
@@ -65,6 +66,10 @@ def migrate():
             exists = connection.execute(text("SELECT 1 FROM sys.indexes WHERE name=:name"), {"name": name}).first()
             if not exists:
                 connection.execute(text(f"CREATE UNIQUE INDEX {name} ON {table} ({columns})"))
+    # Current ORM relationships need their additive workspace schema before
+    # hydrating legacy leads. This also preserves old standalone upgrade paths.
+    from scripts.migrate_team_workflow import migrate as migrate_workflow
+    migrate_workflow()
     # Restartable batches. Old results retain original dates and imported notes.
     count = 0
     with Session(engine, expire_on_commit=False) as db:

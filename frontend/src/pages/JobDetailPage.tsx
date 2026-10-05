@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useDeferredValue } from 'react';
+import { lazy, Suspense, useState, useEffect, useDeferredValue, useRef } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { motion } from 'framer-motion';
@@ -9,6 +9,8 @@ import {
 } from 'lucide-react';
 import { TopBar } from '@/components/TopBar';
 import { LeadTracking } from '@/components/LeadTracking';
+import { EvidenceBadge, FollowUpBadge, OwnerBadge } from '@/components/LeadWorkflow';
+import { invalidateLeadWorkspace, mergeLeadSnapshot } from '@/lib/workspace';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Badge, StatusBadge, PriorityBadge, ScoreChip } from '@/components/ui/Badge';
@@ -33,6 +35,10 @@ const PREFETCH_AHEAD = 2;
 
 export function JobDetailPage() {
   const { jobId = '' } = useParams();
+  return <JobDetailContent key={jobId} jobId={jobId} />;
+}
+
+function JobDetailContent({ jobId }: { jobId: string }) {
   const navigate = useNavigate();
   const { toast } = useToast();
   const qc = useQueryClient();
@@ -46,6 +52,7 @@ export function JobDetailPage() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [resumeIcp, setResumeIcp] = useState('');
   const [starting, setStarting] = useState(false);
+  const opening = useRef(0);
   const deferredSearch = useDeferredValue(search.trim());
 
   // ── Job status (live poll while running) ──────────────────────────────────
@@ -121,14 +128,14 @@ export function JobDetailPage() {
   };
 
   const openLead = async (lead: LeadResult) => {
+    const request = ++opening.current;
     try {
       const fresh = await getLeadDetail(jobId, lead.lead_id);
-      setSelectedLead(fresh);
-      setDrawerOpen(true);
-    } catch { toast('Could not load lead details', 'error'); }
+      if (request === opening.current) { setSelectedLead(fresh); setDrawerOpen(true); }
+    } catch { if (request === opening.current) toast('Could not load lead details', 'error'); }
   };
   const trackingSaved = (lead: LeadResult) => {
-    setSelectedLead((current) => current?.lead_id === lead.lead_id ? lead : current);
+    setSelectedLead((current) => current?.lead_id === lead.lead_id ? mergeLeadSnapshot(current, lead) : current);
   };
 
   const goToPage = (p: number) => setPage(Math.max(0, Math.min(totalPages - 1, p)));
@@ -139,6 +146,7 @@ export function JobDetailPage() {
       await deleteJob(jobId);
       toast('Job deleted', 'success');
       qc.invalidateQueries({ queryKey: ['jobs'] });
+      void invalidateLeadWorkspace(qc);
       navigate('/dashboard');
     } catch {
       toast('Failed to delete job', 'error');
@@ -335,6 +343,8 @@ export function JobDetailPage() {
                       <Th onClick={() => toggleSort('priority')}><span className="flex items-center gap-1">Priority {sortIcon('priority')}</span></Th>
                       <Th>Validation</Th>
                       <Th>Reviewed</Th>
+                      <Th>Owner / follow-up</Th>
+                      <Th>Evidence</Th>
                       <Th>Notes / history</Th>
                     </tr>
                   </thead>
@@ -354,6 +364,8 @@ export function JobDetailPage() {
                           {lead.validation_status ? <Badge color={lead.validation_status === 'Passed' ? 'success' : 'warning'}>{lead.validation_status}</Badge> : <span className="text-slate-400">—</span>}
                         </td>
                         <td className="px-4 py-3"><LeadTracking lead={lead} jobId={jobId} onSaved={trackingSaved} /></td>
+                        <td className="px-4 py-3"><div className="space-y-1"><OwnerBadge lead={lead} /><div><FollowUpBadge lead={lead} /></div></div></td>
+                        <td className="px-4 py-3"><EvidenceBadge lead={lead} /></td>
                         <td className="px-4 py-3 max-w-[180px]">
                           <button type="button" onClick={(event) => { event.stopPropagation(); void openLead(lead); }}
                             className="block max-w-full truncate text-left text-xs text-brand-700 hover:underline">
@@ -384,6 +396,7 @@ export function JobDetailPage() {
                       <button type="button" onClick={(event) => { event.stopPropagation(); void openLead(lead); }} className="text-brand-700 underline">{lead.tracking_notes ? 'View notes' : 'Add notes'}</button>
                       {lead.reuse_kind && <span className="text-sky-700">{lead.reuse_kind === 'full' ? 'Result reused' : 'Research reused'}</span>}
                     </div>
+                    <div className="mb-2 flex flex-wrap gap-2"><OwnerBadge lead={lead} /><FollowUpBadge lead={lead} /><EvidenceBadge lead={lead} /></div>
                     {lead.email_address && (
                       <div className="flex items-center gap-1 mt-1 text-xs text-slate-400">
                         <Mail className="h-3 w-3" /> {lead.email_address}
@@ -431,7 +444,7 @@ export function JobDetailPage() {
       {/* Lead drawer */}
       {drawerOpen && (
         <Suspense fallback={null}>
-          <LeadDetailDrawer jobId={jobId} onSaved={trackingSaved} lead={selectedLead} open={drawerOpen} onClose={() => setDrawerOpen(false)} />
+          <LeadDetailDrawer jobId={jobId} onSaved={trackingSaved} lead={selectedLead} open={drawerOpen} onClose={() => { opening.current += 1; setDrawerOpen(false); }} />
         </Suspense>
       )}
 

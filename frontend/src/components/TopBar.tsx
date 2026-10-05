@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useLocation } from 'react-router-dom';
-import { Sparkles, LogOut, Activity, LayoutDashboard, Upload } from 'lucide-react';
-import { getHealth } from '@/api/endpoints';
+import { Sparkles, LogOut, Activity, LayoutDashboard, Upload, Users, Bell } from 'lucide-react';
+import { getHealth, getReminders } from '@/api/endpoints';
 import { clearAuth, getUser } from '@/lib/auth';
 import { useToast } from '@/components/ui/Toast';
 
@@ -20,6 +20,11 @@ export function TopBar() {
   });
 
   const healthy = health?.status === 'ok' || health?.status === 'healthy';
+  const { data: reminders } = useQuery({
+    queryKey: ['workspace-reminders', 'badge'],
+    queryFn: () => getReminders('due', 0, 1),
+    refetchInterval: 60_000,
+  });
 
   const handleLogout = () => {
     clearAuth();
@@ -57,10 +62,15 @@ export function TopBar() {
           <nav className="hidden md:flex items-center gap-1">
             {navLink('/dashboard', 'Dashboard', <LayoutDashboard className="h-4 w-4" />)}
             {navLink('/upload', 'Upload', <Upload className="h-4 w-4" />)}
+            {navLink('/leads', 'Leads', <Users className="h-4 w-4" />)}
           </nav>
         </div>
 
         <div className="flex items-center gap-3">
+          <Link to="/dashboard" title="Due follow-up reminders" aria-label={reminders ? `${reminders.counts.due} due follow-up reminders` : 'Open follow-up reminders'} className="relative rounded-lg p-2 text-slate-600 hover:bg-brand-50">
+            <Bell className="h-4 w-4" />
+            {!!reminders?.counts.due && <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-rose-500 px-1 text-center text-[10px] font-semibold text-white">{reminders.counts.due > 99 ? '99+' : reminders.counts.due}</span>}
+          </Link>
           {/* Health pill */}
           <div
             className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold ring-1 ring-inset ${

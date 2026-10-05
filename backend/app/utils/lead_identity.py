@@ -5,10 +5,10 @@ import unicodedata
 import uuid
 from urllib.parse import urlsplit
 
-from sqlalchemy import or_, text
+from sqlalchemy import exists, or_, text
 from sqlalchemy.orm import selectinload
 
-from app.models import FinalScore, Lead, LeadTracking, ValidationResult
+from app.models import FinalScore, Lead, LeadRefresh, LeadTracking, ValidationResult
 
 
 def normalized(value):
@@ -154,11 +154,14 @@ def reusable_lead(db, lead, icp_prompt):
         return None, None
     candidates = (db.query(Lead).filter(
         Lead.tracking_id == lead.tracking_id, Lead.id != lead.id,
-        Lead.processing_status == "completed",
+        or_(Lead.processing_status == "completed", exists().where(
+            LeadRefresh.lead_id == Lead.id, LeadRefresh.status == "completed")),
+        ~exists().where(LeadRefresh.lead_id == Lead.id,
+                        LeadRefresh.status.in_(("queued", "running"))),
         Lead.research_fingerprint == lead.research_fingerprint,
     ).options(selectinload(Lead.validation_results), selectinload(Lead.final_score),
-              selectinload(Lead.job)).order_by(Lead.created_at.desc(), Lead.id).all())
-    research_candidate = None
+              selectinload(Lead.job)).order_by(
+                  Lead.evidence_checked_at.desc(), Lead.created_at.desc(), Lead.id).all())
     for candidate in candidates:
         stages = {v.stage: v for v in candidate.validation_results}
         if not candidate.final_score or not {"icp", "web", "contact"}.issubset(stages):
@@ -171,9 +174,11 @@ def reusable_lead(db, lead, icp_prompt):
             return candidate, "full"
         # Legacy research without structured evidence cannot validate a new ICP.
         evidence = json_object(stages["web"].raw_output).get("evidence")
-        if isinstance(evidence, dict) and evidence and research_candidate is None:
-            research_candidate = candidate
-    return (research_candidate, "research") if research_candidate else (None, None)
+        if isinstance(evidence, dict) and evidence:
+            # Fresh research takes precedence over an older score for a matching
+            # ICP: score the new evidence instead of restoring outdated facts.
+            return candidate, "research"
+    return None, None
 
 
 def json_object(value):
@@ -195,5 +200,6 @@ def copy_result(db, source, target):
         for column in FinalScore.__table__.columns if column.name not in {"id", "lead_id"}}))
     target.company_description = source.company_description
     target.technologies_used = source.technologies_used
+    target.evidence_checked_at = source.evidence_checked_at
     target.reused_from_lead_id = source.reused_from_lead_id or source.id
     target.reuse_kind = "full"

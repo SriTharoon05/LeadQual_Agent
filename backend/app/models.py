@@ -14,7 +14,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Boolean, DateTime, Float, ForeignKey,
-    Integer, String, Text, UniqueConstraint, func,
+    Index, Integer, String, Text, Unicode, UnicodeText, UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -74,6 +74,9 @@ class Job(Base):
         foreign_keys="LLMCallLog.job_id",
     )    
 
+    chat_conversations: Mapped[list["ChatConversation"]] = relationship(
+        "ChatConversation", cascade="all, delete-orphan")
+
     @property
     def progress_pct(self) -> float:
         if not self.total_rows:
@@ -115,6 +118,27 @@ class LLMCallLog(Base):
                 f"job={self.job_id}>")
 
 # ── leads ─────────────────────────────────────────────────────────────────────
+class TeamMember(Base):
+    __tablename__ = "team_member"
+    id: Mapped[str] = mapped_column(UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(Unicode(100), nullable=False)
+    email: Mapped[Optional[str]] = mapped_column(Unicode(255), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.getutcdate())
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class SavedSegment(Base):
+    __tablename__ = "saved_segment"
+    id: Mapped[str] = mapped_column(UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(Unicode(100), nullable=False)
+    filters_json: Mapped[str] = mapped_column(UnicodeText, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.getutcdate())
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class LeadTracking(Base):
     """Shared manual tracking, independent of a particular upload/job."""
     __tablename__ = "lead_tracking"
@@ -123,10 +147,18 @@ class LeadTracking(Base):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    owner_id: Mapped[Optional[str]] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("team_member.id"), nullable=True, index=True)
+    owner: Mapped[Optional["TeamMember"]] = relationship(lazy="joined")
+    follow_up_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    follow_up_note: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
+    follow_up_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    __table_args__ = (Index("ix_tracking_owner_due", "owner_id", "follow_up_completed_at", "follow_up_at"),)
 
 
 class Lead(Base):
     __tablename__ = "leads"
+    __table_args__ = (Index("ix_leads_job_row", "job_id", "row_index"),)
 
     id: Mapped[str] = mapped_column(
         UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
@@ -186,6 +218,7 @@ class Lead(Base):
     lead_source: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     processing_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    evidence_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.getutcdate()
@@ -210,9 +243,33 @@ class Lead(Base):
         "LLMCallLog", cascade="all, delete-orphan",
         foreign_keys="LLMCallLog.lead_id",
     )
+    refresh_requests: Mapped[list["LeadRefresh"]] = relationship(
+        "LeadRefresh", cascade="all, delete-orphan", lazy="selectin",
+        order_by="desc(LeadRefresh.created_at), desc(LeadRefresh.id)")
 
     def __repr__(self) -> str:
         return f"<Lead id={self.id} name={self.contact_name} company={self.company_name}>"
+
+
+class LeadRefresh(Base):
+    __tablename__ = "lead_refresh"
+    __table_args__ = (
+        Index("ix_refresh_dispatch", "status", "last_dispatched_at", "created_at"),
+        Index("uq_lead_refresh_active", "lead_id", unique=True,
+              mssql_where=text("status IN ('queued', 'running')"),
+              sqlite_where=text("status IN ('queued', 'running')")),
+    )
+    id: Mapped[str] = mapped_column(UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid)
+    lead_id: Mapped[str] = mapped_column(UNIQUEIDENTIFIER, ForeignKey("leads.id"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
+    requested_by: Mapped[Optional[str]] = mapped_column(Unicode(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.getutcdate())
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Unicode(1000), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_dispatched_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    previous_snapshot_json: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True, deferred=True)
 
 
 # ── validation_results ────────────────────────────────────────────────────────
@@ -331,8 +388,26 @@ class AdminUser(Base):
 
 
 # ── chat_message (session-scoped chatbot history) ─────────────────────────────
+class ChatConversation(Base):
+    """One independent chat per browser conversation, scoped to its upload."""
+    __tablename__ = "chat_conversation"
+
+    id: Mapped[str] = mapped_column(UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid)
+    job_id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("jobs.id"), nullable=False, index=True)
+    next_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.getutcdate())
+    messages: Mapped[list["ChatMessage"]] = relationship(
+        "ChatMessage", cascade="all, delete-orphan", order_by="ChatMessage.sequence")
+
+
 class ChatMessage(Base):
     __tablename__ = "chat_message"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "sequence", name="uq_chat_conversation_sequence"),
+        UniqueConstraint("conversation_id", "request_id", "role", name="uq_chat_request_role"),
+    )
 
     id: Mapped[str] = mapped_column(
         UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
@@ -340,8 +415,15 @@ class ChatMessage(Base):
     job_id: Mapped[str] = mapped_column(
         UNIQUEIDENTIFIER, ForeignKey("jobs.id"), nullable=False, index=True
     )
+    conversation_id: Mapped[str] = mapped_column(
+        UNIQUEIDENTIFIER, ForeignKey("chat_conversation.id"), nullable=False, index=True)
+    request_id: Mapped[str] = mapped_column(UNIQUEIDENTIFIER, nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    tool_used: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    sources_json: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
+    metadata_json: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
     role:    Mapped[str] = mapped_column(String(20), nullable=False)   # user | assistant
-    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(UnicodeText, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.getutcdate()

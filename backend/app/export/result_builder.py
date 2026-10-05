@@ -38,6 +38,7 @@ from app.config import (
     settings,
 )
 from app.models import Lead
+from app.lead_results import follow_up_status, freshness, utc
 from app.utils.lead_identity import json_object
 from app.validators.evidence import proof_rows
 
@@ -47,6 +48,9 @@ logger = logging.getLogger(__name__)
 ALL_COLUMNS: list[str] = CANONICAL_COLUMNS + EXPORT_EXTRA_COLUMNS + [
     "Reviewed", "Tracking Notes", "Reuse Type", "Reused From Lead ID", "ICP Input",
     "Evidence Checked At", "Current Employment", "ICP Validation Proofs",
+    "Lead Owner", "Owner Active", "Follow-up At (UTC)", "Follow-up Note",
+    "Follow-up Completed At (UTC)", "Follow-up Status", "Evidence Age (Days)",
+    "Evidence Status", "Refresh Status",
 ]
 
 # Header style constants
@@ -93,12 +97,16 @@ def _fetch_rows(job_id: str, db: Session) -> list[dict]:
     leads = (
         db.query(Lead)
         .filter(Lead.job_id == job_id)
-        .options(joinedload(Lead.job), joinedload(Lead.final_score), selectinload(Lead.validation_results))
-        .order_by(Lead.row_index)
+        .options(
+            joinedload(Lead.job), joinedload(Lead.final_score), joinedload(Lead.tracking),
+            selectinload(Lead.validation_results), selectinload(Lead.refresh_requests),
+        )
+        .order_by(Lead.row_index, Lead.id)
         .all()
     )
 
     rows: list[dict] = []
+    now = datetime.now(timezone.utc)
     for lead in leads:
         row: dict = {
             # 29 canonical columns
@@ -176,18 +184,33 @@ def _fetch_rows(job_id: str, db: Session) -> list[dict]:
         icp = next((v for v in lead.validation_results if v.stage == "icp"), None)
         web_data = json_object(web.raw_output) if web else {}
         proofs = proof_rows(web_data, json_object(icp.raw_output) if icp else {})
+        tracking = lead.tracking
+        owner = tracking.owner if tracking else None
+        evidence_status, evidence_age = freshness(lead.evidence_checked_at, now)
+        runs = lead.refresh_requests or []
+        active_refresh = next((run for run in runs if run.status in {"queued", "running"}), None)
+        latest_refresh = active_refresh or next(iter(runs), None)
         row.update({
             "Reviewed": "Yes" if lead.tracking and lead.tracking.reviewed else "No",
             "Tracking Notes": lead.tracking.notes or "" if lead.tracking else "",
             "Reuse Type": lead.reuse_kind or "New",
             "Reused From Lead ID": str(lead.reused_from_lead_id or ""),
             "ICP Input": lead.job.icp_prompt or "",
-            "Evidence Checked At": web_data.get("checked_at", ""),
+            "Evidence Checked At": _fmt_date(lead.evidence_checked_at),
             "Current Employment": web_data.get("employment_status", "unclear"),
             "ICP Validation Proofs": "\n\n".join(
                 f"{p['label']} | ICP: {p['requirement']} | Finding: {p['value']} | {p['verdict']}\n"
                 + " | ".join(source["url"] for source in p["sources"])
                 for p in proofs) or "Evidence unavailable for this earlier result",
+            "Lead Owner": owner.name if owner else "",
+            "Owner Active": ("Yes" if owner.active else "No") if owner else "",
+            "Follow-up At (UTC)": _fmt_date(tracking.follow_up_at) if tracking else "",
+            "Follow-up Note": (tracking.follow_up_note or "") if tracking else "",
+            "Follow-up Completed At (UTC)": _fmt_date(tracking.follow_up_completed_at) if tracking else "",
+            "Follow-up Status": follow_up_status(tracking, now),
+            "Evidence Age (Days)": evidence_age if evidence_age is not None else "",
+            "Evidence Status": evidence_status,
+            "Refresh Status": latest_refresh.status if latest_refresh else "",
         })
         rows.append(row)
 
@@ -257,6 +280,8 @@ def _build_excel(rows: list[dict]) -> bytes:
         "Outreach Intelligence": 60,
         "Source URLs": 60,
         "Tracking Notes": 45, "ICP Input": 55, "ICP Validation Proofs": 70,
+        "Lead Owner": 25, "Follow-up Note": 45, "Follow-up At (UTC)": 28,
+        "Follow-up Completed At (UTC)": 28, "Evidence Checked At": 28,
     }
     default_width = 18
     for col_num, col_name in enumerate(ALL_COLUMNS, start=1):
@@ -352,6 +377,11 @@ def _fmt_score(v: Optional[float]) -> str:
     if v is None:
         return ""
     return f"{v:.1f}"
+
+
+def _fmt_date(value: Optional[datetime]) -> str:
+    """ISO UTC text remains readable in CSV and avoids Excel timezone errors."""
+    return utc(value).isoformat().replace("+00:00", "Z") if value is not None else ""
 
 
 def _safe_cell(value):

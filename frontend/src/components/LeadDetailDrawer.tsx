@@ -12,6 +12,7 @@ import { dash, num, safeArr, numVal } from '@/lib/format';
 import type { LeadResult } from '@/types';
 import { IcpEvidence, SourceGlobe } from './IcpEvidence';
 import { LeadTracking } from './LeadTracking';
+import { LeadWorkflow, LeadEvidenceRefresh } from './LeadWorkflow';
 
 export function LeadDetailDrawer({ lead, open, onClose, jobId, onSaved }: {
   jobId: string;
@@ -150,7 +151,12 @@ function LeadDetailContent({ lead, jobId, onSaved }: { lead: LeadResult; jobId: 
         <LeadTracking lead={lead} jobId={jobId} onSaved={onSaved} notes />
       </Section>
 
+      <Section icon={<User className="h-4 w-4" />} title="Ownership & follow-up">
+        <LeadWorkflow lead={lead} jobId={jobId} onSaved={onSaved} />
+      </Section>
+
       <Section icon={<Lightbulb className="h-4 w-4" />} title="AI Reasoning">
+        <LeadEvidenceRefresh lead={lead} jobId={jobId} onSaved={onSaved} />
         {lead.reuse_kind && <p className="mb-3 rounded-lg bg-sky-50 p-2 text-xs text-sky-800">{lead.reuse_kind === 'full' ? 'Saved result reused from an earlier upload.' : 'Saved research reused; qualification recalculated for this upload.'}</p>}
         <IcpEvidence lead={lead} />
       </Section>
