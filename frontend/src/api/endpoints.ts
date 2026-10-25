@@ -16,8 +16,8 @@ import type {
 } from '@/types';
 
 // ── Auth ────────────────────────────────────────────────────────────────────
-export const login = async (username: string, password: string): Promise<LoginResponse> => {
-  const { data } = await apiClient.post<LoginResponse>('/auth/login', { username, password });
+export const login = async (username: string, password: string, signal?: AbortSignal): Promise<LoginResponse> => {
+  const { data } = await apiClient.post<LoginResponse>('/auth/login', { username, password }, { signal });
   return data;
 };
 
@@ -28,9 +28,10 @@ export const getHealth = async (): Promise<HealthResponse> => {
 };
 
 // ── Jobs / Upload pipeline ──────────────────────────────────────────────────
-export const uploadFile = async (file: File): Promise<UploadResponse> => {
+export const uploadFile = async (file: File, requestId?: string): Promise<UploadResponse> => {
   const form = new FormData();
   form.append('file', file);
+  if (requestId) form.append('request_id', requestId);
   const { data } = await apiClient.post<UploadResponse>('/upload', form, {
     headers: { 'Content-Type': 'multipart/form-data' },
     timeout: 120000,   // headroom for the initial file transfer of large files
@@ -54,8 +55,8 @@ export const getDashboardStats = async (): Promise<DashboardStatsResponse> => {
   return data;
 };
 
-export const getJobStatus = async (jobId: string): Promise<JobStatusResponse> => {
-  const { data } = await apiClient.get<JobStatusResponse>(`/jobs/${jobId}/status`);
+export const getJobStatus = async (jobId: string, signal?: AbortSignal): Promise<JobStatusResponse> => {
+  const { data } = await apiClient.get<JobStatusResponse>(`/jobs/${jobId}/status`, { signal });
   return data;
 };
 
@@ -79,14 +80,17 @@ export const getResultsPage = async (
   offset = 0,
   limit = 50,
   filters?: { search?: string; priority?: string; sortBy?: string; sortDir?: string },
+  signal?: AbortSignal,
 ): Promise<PaginatedLeads> => {
   const { data } = await apiClient.get(`/jobs/${jobId}/results`, {
+    signal,
     params: {
       limit, offset,
       search: filters?.search || undefined,
       priority: filters?.priority === 'all' ? undefined : filters?.priority,
       sort_by: filters?.sortBy,
       sort_dir: filters?.sortDir,
+      details: false,
     },
   });
   return {
@@ -118,8 +122,8 @@ export const getJobResults = async (jobId: string): Promise<LeadResult[]> => {
   return all;
 };
 
-export const getLeadDetail = async (jobId: string, leadId: string): Promise<LeadResult> => {
-  const { data } = await apiClient.get<LeadResult>(`/jobs/${jobId}/results/${leadId}`);
+export const getLeadDetail = async (jobId: string, leadId: string, signal?: AbortSignal): Promise<LeadResult> => {
+  const { data } = await apiClient.get<LeadResult>(`/jobs/${jobId}/results/${leadId}`, { signal });
   return data;
 };
 
@@ -166,16 +170,18 @@ export const deleteSegment = async (id: string, version: number): Promise<void> 
   await apiClient.delete(`/workspace/segments/${id}`, { params: { version } });
 };
 
-export const getWorkspaceLeads = async (filters: LeadFilters, offset = 0, limit = 50, segmentId?: string): Promise<WorkspaceLeadPage> => {
+export const getWorkspaceLeads = async (filters: LeadFilters, offset = 0, limit = 50, segmentId?: string, signal?: AbortSignal): Promise<WorkspaceLeadPage> => {
   const { data } = await apiClient.get<WorkspaceLeadPage>('/workspace/leads', {
-    params: { ...(segmentId ? { segment_id: segmentId } : filters), offset, limit },
+    params: { ...(segmentId ? { segment_id: segmentId } : filters), offset, limit, details: false },
+    signal,
   });
   return data;
 };
 
-export const getReminders = async (status: 'all' | 'due' | 'upcoming' | 'completed', offset = 0, limit = 10, ownerId?: string): Promise<ReminderPage> => {
+export const getReminders = async (status: 'all' | 'due' | 'upcoming' | 'completed', offset = 0, limit = 10, ownerId?: string, signal?: AbortSignal): Promise<ReminderPage> => {
   const { data } = await apiClient.get<ReminderPage & { due_count?: number; upcoming_count?: number; completed_count?: number }>('/workspace/reminders', {
-    params: { status, offset, limit, owner_id: ownerId || undefined },
+    params: { status, offset, limit, owner_id: ownerId || undefined, details: false },
+    signal,
   });
   return { ...data, counts: data.counts || { due: data.due_count || 0, upcoming: data.upcoming_count || 0, completed: data.completed_count || 0 } };
 };
@@ -194,29 +200,43 @@ export const deleteJob = async (jobId: string): Promise<void> => {
   await apiClient.delete(`/jobs/${jobId}`);
 };
 
-export const exportExcel = (jobId: string): string =>
-  `${apiClient.defaults.baseURL}/jobs/${jobId}/export/excel`;
+export interface ExportStatus {
+  export_id: string;
+  job_id: string;
+  format: 'excel' | 'csv';
+  status: 'queued' | 'running' | 'ready' | 'failed';
+  phase: string;
+  rows_written: number;
+  total_rows: number;
+  created_at: number;
+  ready_at?: number | null;
+  snapshot_at?: string | null;
+  error?: string | null;
+  size_bytes?: number | null;
+  filename?: string | null;
+  download_path?: string;
+}
 
-export const exportCsv = (jobId: string): string =>
-  `${apiClient.defaults.baseURL}/jobs/${jobId}/export/csv`;
-
-// Download export with auth header
-export const downloadExport = async (jobId: string, format: 'excel' | 'csv'): Promise<void> => {
-  const ext = format === 'excel' ? 'excel' : 'csv';
-  const resp = await apiClient.get(`/jobs/${jobId}/export/${ext}`, {
-    responseType: 'blob',
+export const prepareExport = async (jobId: string, format: 'excel' | 'csv', signal?: AbortSignal): Promise<ExportStatus> => {
+  const { data } = await apiClient.post<ExportStatus>(`/jobs/${jobId}/exports`, null, {
+    params: { format }, timeout: 20_000, signal,
   });
-  const disposition = resp.headers['content-disposition'] ?? '';
-  const match = disposition.match(/filename="?([^";\n]+)"?/);
-  const filename = match?.[1] ?? `job_${jobId}.${format === 'excel' ? 'xlsx' : 'csv'}`;
-  const url = window.URL.createObjectURL(resp.data);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  window.URL.revokeObjectURL(url);
+  return data;
+};
+
+export const getExportStatus = async (jobId: string, exportId: string, signal?: AbortSignal): Promise<ExportStatus> => {
+  const { data } = await apiClient.get<ExportStatus>(`/jobs/${jobId}/exports/${exportId}`, {
+    timeout: 20_000, signal,
+  });
+  return data;
+};
+
+// A native browser transfer avoids buffering the entire file as a JS Blob.
+export const exportDownloadUrl = (path: string): string => {
+  if (!/^\/jobs\/[0-9a-f-]+\/exports\/[0-9a-f-]+\/file\?ticket=/i.test(path)) {
+    throw new Error('The server returned an invalid download link.');
+  }
+  return new URL(`${(apiClient.defaults.baseURL ?? '').replace(/\/$/, '')}${path}`, window.location.origin).href;
 };
 
 // ── Chat ────────────────────────────────────────────────────────────────────
@@ -231,15 +251,19 @@ export const sendChat = async (
 };
 
 export const getChatHistory = async (
-  jobId: string, conversationId: string, signal?: AbortSignal,
+  jobId: string, conversationId: string, signal?: AbortSignal, beforeSequence?: number, limit = 100,
 ): Promise<ChatMessage[]> => {
   const { data } = await apiClient.get<ChatMessage[]>(`/jobs/${jobId}/chat/history`, {
-    params: { conversation_id: conversationId },
+    params: { conversation_id: conversationId, before_sequence: beforeSequence, limit },
     signal,
   });
   if (!Array.isArray(data) || data.some((message) => !message || typeof message.id !== 'string'
-      || !['user', 'assistant'].includes(message.role) || !Number.isInteger(message.sequence))) {
+      || typeof message.content !== 'string' || typeof message.created_at !== 'string'
+      || !Number.isFinite(Date.parse(message.created_at))
+      || (message.request_id != null && typeof message.request_id !== 'string')
+      || !['user', 'assistant'].includes(message.role) || !Number.isInteger(message.sequence)
+      || message.sequence < 1 || (message.sources != null && !Array.isArray(message.sources)))) {
     throw new Error('The server returned invalid chat history. Please reload the conversation.');
   }
-  return data;
+  return data.map((message) => ({ ...message, sources: message.sources ?? [] }));
 };

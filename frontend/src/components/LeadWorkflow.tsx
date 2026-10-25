@@ -37,6 +37,7 @@ export function LeadWorkflow({ lead, jobId, onSaved }: { lead: LeadResult; jobId
   const [note, setNote] = useState(lead.follow_up_note || '');
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const [error, setError] = useState('');
   const qc = useQueryClient();
   const { toast } = useToast();
@@ -46,7 +47,8 @@ export function LeadWorkflow({ lead, jobId, onSaved }: { lead: LeadResult; jobId
   }, [lead.owner_id, lead.follow_up_at, lead.follow_up_note, dirty]);
 
   const save = async (changes: Omit<TrackingUpdate, 'version'>, clearDraft = false) => {
-    if (saving) return;
+    if (savingRef.current) return;
+    savingRef.current = true;
     setSaving(true); setError('');
     try {
       const fresh = await updateLeadTracking(jobId, lead.lead_id, { version: lead.tracking_version, ...changes });
@@ -65,7 +67,7 @@ export function LeadWorkflow({ lead, jobId, onSaved }: { lead: LeadResult; jobId
         } catch { setError('Your draft is retained, but the latest saved details could not be loaded. Reload the lead before saving again.'); }
         await invalidateLeadWorkspace(qc);
       }
-    } finally { setSaving(false); }
+    } finally { savingRef.current = false; setSaving(false); }
   };
 
   const saveDraft = () => {
@@ -137,6 +139,7 @@ export function LeadEvidenceRefresh({ lead, jobId, onSaved }: { lead: LeadResult
   const qc = useQueryClient();
   const { toast } = useToast();
   const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
   const [error, setError] = useState('');
   const requestKey = `lead-refresh-request:${jobId}:${lead.lead_id}`;
   const requestId = useRef<string | null>((() => {
@@ -177,7 +180,8 @@ export function LeadEvidenceRefresh({ lead, jobId, onSaved }: { lead: LeadResult
   }, [latest, jobId, lead.lead_id, qc]);
 
   const start = async () => {
-    if (sending || busy) return;
+    if (sendingRef.current || busy) return;
+    sendingRef.current = true;
     setSending(true); setError('');
     requestId.current ||= workspaceRequestId();
     try { sessionStorage.setItem(requestKey, requestId.current); } catch { /* storage can be disabled */ }
@@ -207,7 +211,7 @@ export function LeadEvidenceRefresh({ lead, jobId, onSaved }: { lead: LeadResult
       if (status && status < 500 && status !== 408 && status !== 429) clearRequestId();
       setError('Could not confirm the refresh request. Retry safely; the same request will not start duplicate research.');
       void refresh.refetch();
-    } finally { setSending(false); }
+    } finally { sendingRef.current = false; setSending(false); }
   };
   return <div className="mb-4 rounded-xl border border-slate-200 bg-white p-4 space-y-3">
     <div className="flex flex-wrap items-center justify-between gap-2">

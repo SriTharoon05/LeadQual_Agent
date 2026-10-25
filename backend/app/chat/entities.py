@@ -2,10 +2,13 @@
 
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from collections import OrderedDict
 import re
+from threading import RLock
+from time import monotonic
 import unicodedata
 
-from app.models import Lead
+from app.models import Job, Lead
 
 
 def normalized(value: str) -> str:
@@ -36,6 +39,13 @@ class Registry:
     companies: dict[str, list[str]] = field(default_factory=dict)
     people: dict[str, list[dict]] = field(default_factory=dict)
     by_id: dict[str, dict] = field(default_factory=dict)
+    candidate_buckets: dict[tuple[str, str], set[str]] = field(default_factory=dict)
+
+
+_registries = OrderedDict()
+_registry_lock = RLock()
+_REGISTRY_TTL = 15.0
+_REGISTRY_RECORD_BUDGET = 100_000
 
 
 def load_registry(db, job_id: str) -> Registry:
@@ -44,6 +54,16 @@ def load_registry(db, job_id: str) -> Registry:
     Failures deliberately propagate to the API; a DB outage is not an empty job.
     Only identifiers and names are loaded, never every lead's research payload.
     """
+    key = str(job_id).lower()
+    job = db.get(Job, job_id)
+    cacheable = bool(job and job.status == "completed")
+    if cacheable:
+        with _registry_lock:
+            cached = _registries.get(key)
+            if cached and monotonic() - cached[0] < _REGISTRY_TTL:
+                _registries.move_to_end(key)
+                return cached[1]
+            _registries.pop(key, None)
     registry = Registry()
     rows = db.query(Lead.id, Lead.company_name, Lead.contact_name, Lead.row_index).filter(
         Lead.job_id == job_id).all()
@@ -59,6 +79,19 @@ def load_registry(db, job_id: str) -> Registry:
         person_key = normalized(person)
         if person_key:
             registry.people.setdefault(person_key, []).append(record)
+    for kind, names in (("company", registry.companies), ("person", registry.people)):
+        for name in names:
+            registry.candidate_buckets.setdefault((kind, "token:" + name.split()[0]), set()).add(name)
+            for token in name.split():
+                if len(token) >= 2:
+                    registry.candidate_buckets.setdefault((kind, "first:" + token[0]), set()).add(name)
+                    registry.candidate_buckets.setdefault((kind, "second:" + token[1]), set()).add(name)
+    if cacheable and len(registry.by_id) <= _REGISTRY_RECORD_BUDGET:
+        with _registry_lock:
+            _registries[key] = (monotonic(), registry)
+            _registries.move_to_end(key)
+            while len(_registries) > 8 or sum(len(item[1].by_id) for item in _registries.values()) > _REGISTRY_RECORD_BUDGET:
+                _registries.popitem(last=False)
     return registry
 
 
@@ -72,7 +105,10 @@ def exact_mentions(registry: Registry, message: str) -> list[dict]:
     explicit_company = bool(re.search(r"\b(?:company|organization|organisation)\b", message, re.I))
     mentions = []
     for kind, names in (("company", registry.companies), ("person", registry.people)):
-        matches = [key for key in names if _present(key, message_key)
+        candidates = set()
+        for token in message_key.split():
+            candidates.update(registry.candidate_buckets.get((kind, "token:" + token), ()))
+        matches = [key for key in candidates if _present(key, message_key)
                    and (key not in _GENERIC_NAMES or (kind == "company" and explicit_company))]
         # "Acme" inside "Acme Holdings" should not create two different scopes.
         matches.sort(key=len, reverse=True)
@@ -118,6 +154,11 @@ def heuristic_mentions(message: str) -> list[dict]:
             key = normalized(candidate)
             if not key or key in _ENTITY_STOP or len(key.split()) > 8 or key.startswith("row "):
                 continue
+            # 'company size of that' is a field/follow-up, not a company name.
+            if re.match(r"^(?:size|location|revenue|industry|website|description|email|phone|name|details)\b", key):
+                continue
+            if re.fullmatch(r"(?:(?:of|the|that|this|their|his|her|its|same|company|person|contact)\s*)+", key):
+                continue
             # Filter clauses are not entity names, e.g. "for high priority leads".
             if re.search(r"\b(?:priority|score|reviewed|unreviewed|records|rows|leads|contacts)\b", key):
                 continue
@@ -148,14 +189,40 @@ def _nearby(registry: Registry, key: str, kind: str) -> list[dict]:
     scored = []
     for entity_kind in kinds:
         names = registry.companies if entity_kind == "company" else registry.people
-        for name in names:
-            if name in _GENERIC_NAMES:
-                continue
-            ratio = SequenceMatcher(None, key, name).ratio()
-            # A genuine first name or company prefix can be proposed, not assumed.
-            partial = _present(key, name) and len(key) >= 3
-            if ratio >= (0.65 if len(key) >= 5 else 0.78) or partial:
-                scored.append((max(ratio, 0.86 if partial else 0.0), entity_kind, name))
+        candidates = set()
+        for token in key.split():
+            if len(token) >= 2:
+                candidates.update(registry.candidate_buckets.get((entity_kind, "first:" + token[0]), ()))
+                candidates.update(registry.candidate_buckets.get((entity_kind, "second:" + token[1]), ()))
+        # Small registries and unusual Unicode/short names retain full recall.
+        pool = candidates if candidates and len(names) > 1000 else names
+        threshold = 0.65 if len(key) >= 5 else 0.78
+
+        def score_names(values):
+            best_here = 0.0
+            for name in values:
+                if name in _GENERIC_NAMES:
+                    continue
+                # Cheap length/character bounds avoid edit matching every long
+                # company name, while genuine short prefixes retain recall.
+                partial = _present(key, name) and len(key) >= 3
+                if not partial and 2 * min(len(key), len(name)) / max(1, len(key) + len(name)) < threshold:
+                    continue
+                matcher = SequenceMatcher(None, key, name)
+                if not partial and matcher.quick_ratio() < threshold:
+                    continue
+                ratio = matcher.ratio()
+                if ratio >= threshold or partial:
+                    score = max(ratio, 0.86 if partial else 0.0)
+                    scored.append((score, entity_kind, name))
+                    best_here = max(best_here, score)
+            return best_here
+
+        best_here = score_names(pool)
+        if pool is candidates and best_here < 0.9:
+            # A typo in the first two letters can miss both buckets. Broaden the
+            # suggestion search; never quietly choose a weak bucket candidate.
+            score_names(name for name in names if name not in candidates)
     scored.sort(key=lambda item: (-item[0], item[1], item[2]))
     if not scored:
         return []
@@ -218,6 +285,13 @@ def resolve(registry: Registry, mentions: list[dict], selection: dict | None = N
             continue
         company_matches = registry.companies.get(key) if kind != "person" else None
         person_matches = registry.people.get(key) if kind != "company" else None
+        if not company_matches and kind != "person":
+            # Punctuation variants such as RCM&D/RCMD are the same literal
+            # spelling. Only a unique compact spelling is accepted as exact.
+            compact = key.replace(" ", "")
+            aliases = [value for name, value in registry.companies.items() if name.replace(" ", "") == compact]
+            if len(aliases) == 1:
+                company_matches = aliases[0]
         if company_matches and person_matches and kind == "unknown":
             return {"clarification": f"“{mention['value']}” matches a company and a contact. Which did you mean?",
                     "choices": [_company_choice(registry, key), *_person_choices(person_matches)][:8]}

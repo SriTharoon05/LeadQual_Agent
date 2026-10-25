@@ -29,7 +29,7 @@ export function Modal({ open, onClose, title, children, size = 'md' }: ModalProp
     document.body.style.overflow = 'hidden';
     dialog.current?.focus();
     const keydown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') { event.preventDefault(); close.current(); }
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close.current(); }
       if (event.key !== 'Tab') return;
       const controls = Array.from(dialog.current?.querySelectorAll<HTMLElement>(
         'button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex="0"]',

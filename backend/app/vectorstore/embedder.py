@@ -12,6 +12,7 @@ tokenizer dependency; tune CHUNK_WORDS if you prefer tiktoken.
 """
 
 import logging
+import math
 
 from openai import AzureOpenAI
 
@@ -35,6 +36,8 @@ def _client() -> AzureOpenAI:
             api_key=settings.AZURE_OPENAI_API_KEY,
             api_version=settings.AZURE_OPENAI_API_VERSION,
             azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+            timeout=60.0,
+            max_retries=0,
         )
     return _embed_client
 
@@ -64,10 +67,9 @@ def embed(texts: list[str]) -> list[list[float]]:
     """Batch-embed a list of strings → list of vectors (same order)."""
     if not texts:
         return []
+    if any(not isinstance(text, str) or not text.strip() for text in texts):
+        raise ValueError("Embedding inputs must be nonempty text strings")
     client = _client()
-    logger.warning(f"[embed] endpoint={settings.AZURE_OPENAI_ENDPOINT!r}")
-    logger.warning(f"[embed] api_version={settings.AZURE_OPENAI_API_VERSION!r}")
-    logger.warning(f"[embed] deployment={settings.EMBED_DEPLOYMENT!r}")
     out: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
         batch = texts[i:i + EMBED_BATCH]
@@ -75,10 +77,31 @@ def embed(texts: list[str]) -> list[list[float]]:
             model=settings.EMBED_DEPLOYMENT,  
             input=batch,
         )
-        out.extend(d.embedding for d in resp.data)
+        out.extend(_validated_embeddings(resp.data, len(batch)))
     return out
 
 
-def embed_one(text: str) -> list[float]:
+def _validated_embeddings(data, count):
+    rows = list(data or [])
+    if len(rows) != count:
+        raise ValueError("Embedding response count does not match input count")
+    indices = [getattr(row, "index", None) for row in rows]
+    if any(isinstance(index, bool) or not isinstance(index, int) for index in indices) or sorted(indices) != list(range(count)):
+        raise ValueError("Embedding response indices are incomplete or duplicated")
+    vectors = []
+    for row in sorted(rows, key=lambda item: item.index):
+        vector = getattr(row, "embedding", None)
+        if (not isinstance(vector, list) or len(vector) != settings.EMBED_DIM
+                or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in vector)):
+            raise ValueError("Embedding response has an invalid vector or dimension")
+        vectors.append(vector)
+    return vectors
+
+
+def embed_one(text: str, *, timeout: float | None = None) -> list[float]:
     """Embed a single query string."""
+    if timeout is not None and text and text.strip():
+        response = _client().with_options(timeout=timeout, max_retries=0).embeddings.create(
+            model=settings.EMBED_DEPLOYMENT, input=[text[:4000]])
+        return _validated_embeddings(response.data, 1)[0]
     return embed([text])[0] if text and text.strip() else []

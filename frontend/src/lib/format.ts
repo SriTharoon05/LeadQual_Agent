@@ -2,7 +2,7 @@
 export const dash = <T,>(v: T | null | undefined): T | string => (v === null || v === undefined ? '—' : v);
 
 export const num = (v: number | null | undefined, decimals = 1): string => {
-  if (v === null || v === undefined || Number.isNaN(v)) return '—';
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return '—';
   return Number(v).toFixed(decimals);
 };
 
@@ -10,7 +10,7 @@ export const safeArr = <T,>(v: T[] | null | undefined): T[] => (Array.isArray(v)
 
 export const safeLen = <T,>(v: T[] | null | undefined): number => (Array.isArray(v) ? v.length : 0);
 
-export const numVal = (v: number | null | undefined): number => (v === null || v === undefined || Number.isNaN(v) ? 0 : Number(v));
+export const numVal = (v: number | null | undefined): number => (v === null || v === undefined || !Number.isFinite(Number(v)) ? 0 : Number(v));
 
 // ── Date formatting ─────────────────────────────────────────────────────────
 export const fmtDate = (v: string | null | undefined): string => {
@@ -35,10 +35,11 @@ export const fmtDateShort = (v: string | null | undefined): string => {
 
 // ── File size ───────────────────────────────────────────────────────────────
 export const fmtBytes = (bytes: number): string => {
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
   if (bytes === 0) return '0 B';
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const i = Math.max(0, Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k))));
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 };
 

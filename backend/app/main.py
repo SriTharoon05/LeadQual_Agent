@@ -11,8 +11,8 @@ Endpoints:
   GET    /jobs/{job_id}/status        Poll progress
   GET    /jobs/{job_id}/results       All lead results for a job (PAGINATED)
   GET    /jobs/{job_id}/results/{id}  Single lead result
-  GET    /jobs/{job_id}/export/excel  Download enriched .xlsx
-  GET    /jobs/{job_id}/export/csv    Download enriched .csv
+  POST   /jobs/{job_id}/exports       Prepare all saved rows as Excel or CSV
+  GET    /jobs/{job_id}/exports/{id}  Export progress / signed download path
   DELETE /jobs/{job_id}               Delete job and all data
   GET    /health                      Health check
 
@@ -20,37 +20,37 @@ Start with:
     uvicorn app.main:app --reload --port 8000
 """
 
-import io
 import logging
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from azure.storage.blob import BlobServiceClient
-from celery import chord
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import case, func, or_, update
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy import case, event, func, or_, update
+from sqlalchemy.orm import Session, joinedload, selectinload, load_only, noload
 
 from app.config import settings, SUPPORTED_EXTENSIONS
 from app.database import get_db, ping_db, schema_ready
-from app.models import Job, Lead, FinalScore, AdminUser, LeadTracking, TeamMember, LeadRefresh
-from app.lead_results import LeadResultResponse, lead_to_response as _lead_to_response
+from app.models import (Job, Lead, FinalScore, AdminUser, LeadTracking, TeamMember, LeadRefresh,
+                        ProcessingLog, LLMCallLog, ValidationResult, ChatConversation, ChatMessage)
+from app.lead_results import LeadResultResponse, latest_refreshes, lead_to_response as _lead_to_response
 from app.workspace.routes import router as workspace_router
 from app.workspace.filters import LeadFilters, filtered_query
 from app.refresh import router as refresh_router
 from app.utils.lead_identity import transaction_lock
-from app.export.result_builder import build_excel_bytes, build_csv_bytes
-from app.tasks.tasks import process_lead, finalise_job
+from app.export.routes import router as export_router
+from app.tasks.dispatch_task import request_dispatch
 from app.chat.routes import router as chat_router
 from app.vectorstore.qdrant_store import delete_job as qdrant_delete_job
 from app.auth import AuthenticationMiddleware, create_access_token, verify_password
+from app.utils.chat_lease import ConversationLease
 
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,7 @@ app = FastAPI(
 app.include_router(chat_router)
 app.include_router(workspace_router)
 app.include_router(refresh_router)
+app.include_router(export_router)
 
 app.add_middleware(AuthenticationMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -75,6 +76,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "Content-Length", "Content-Range", "Accept-Ranges", "ETag"],
 )
 
 
@@ -83,7 +85,7 @@ async def security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if settings.APP_ENV.lower() == "production":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
@@ -109,6 +111,7 @@ class JobStatusResponse(BaseModel):
     progress_pct:   float
     duplicates_removed: Optional[int] = None   # ← ADD
     import_error:       Optional[str] = None   # ← ADD
+    upload_pending: bool = False
     created_at:     datetime
     completed_at:   Optional[datetime] = None
     llm_model:         Optional[str] = None
@@ -200,15 +203,17 @@ def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
 # ── POST /upload ──────────────────────────────────────────────────────────────
 
 @app.post("/upload", response_model=UploadResponse, status_code=status.HTTP_202_ACCEPTED)
-async def upload_file(
+def upload_file(
     file: UploadFile = File(...),
+    request_id: UUID | None = Form(default=None),
     db:   Session    = Depends(get_db),
 ):
     """
-    Accept an Excel/CSV upload and return IMMEDIATELY.
+    Store an Excel/CSV upload; parsing and qualification run asynchronously.
 
     Heavy work (parse + LLM column-mapping + dedup + bulk insert) runs in a
-    background Celery task, so the request never times out on large files.
+    background Celery task. A stable request ID recovers an accepted transfer
+    after a browser timeout instead of creating a duplicate job.
     The frontend polls GET /jobs/{job_id}/status:
         importing → queued (ready for ICP)  |  import_failed (see import_error)
     """
@@ -222,49 +227,85 @@ async def upload_file(
 
     # ── Read + size-check ─────────────────────────────────────────────────────
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
-    raw_bytes = await file.read(max_bytes + 1)
-    size_mb   = len(raw_bytes) / (1024 * 1024)
-    if size_mb > settings.MAX_UPLOAD_SIZE_MB:
+    # UploadFile is already a seekable spooled file. Inspect its length and
+    # stream to Blob instead of making another complete 50 MB memory copy.
+    file.file.seek(0, 2)
+    size_bytes = file.file.tell()
+    file.file.seek(0)
+    size_mb = size_bytes / (1024 * 1024)
+    if size_bytes > max_bytes:
         raise HTTPException(
             status_code=413,
             detail=f"File too large ({size_mb:.1f} MB). Max: {settings.MAX_UPLOAD_SIZE_MB} MB",
         )
+    if not size_bytes:
+        raise HTTPException(status_code=422, detail="The uploaded file is empty.")
+    if len(file.filename or "") > 500:
+        raise HTTPException(status_code=422, detail="The file name is too long.")
 
-    # ── Create the job in 'importing' state ───────────────────────────────────
-    job = Job(
-        status=    "importing",
-        total_rows= None,
-        file_name=  file.filename,
-        file_type=  suffix.lstrip("."),
-    )
-    db.add(job)
-    db.flush()                      # get job.id
-    job_id = str(job.id)
-
-    # ── Store the raw file to Blob so the worker can read it ──────────────────
-    blob_name = f"uploads/{job_id}/source{suffix}"
-    if not await run_in_threadpool(_store_raw_to_blob, raw_bytes, blob_name):
-        job.status = "import_failed"
-        job.import_error = "Could not store the uploaded file. Check Blob storage."
+    signature = hashlib.sha256()
+    signature.update((str(file.filename or "") + "\0" + suffix + "\0").encode("utf-8"))
+    while block := file.file.read(256 * 1024):
+        signature.update(block)
+    file.file.seek(0)
+    fingerprint = signature.hexdigest()
+    job_id = str(request_id or uuid4())
+    lease = ConversationLease("upload:" + job_id)
+    guarded = False
+    try:
+        lease.acquire()
+        event.listen(db, "before_commit", lease.assert_owned)
+        guarded = True
+        job = db.get(Job, job_id)
+        if job is not None:
+            if not job.upload_fingerprint or job.upload_fingerprint != fingerprint:
+                raise HTTPException(409, "This upload request ID was used for a different file. Select a new file/upload request.")
+            if job.source_blob_name is not None:
+                return UploadResponse(job_id=job_id, file_name=job.file_name or file.filename,
+                    file_type=job.file_type or suffix.lstrip("."), status=job.status,
+                    message="This upload was already accepted. Continue with the existing job.")
+            job.status, job.import_error = "importing", None
+        else:
+            job = Job(id=job_id, status="importing", total_rows=None,
+                file_name=file.filename, file_type=suffix.lstrip("."), upload_fingerprint=fingerprint)
+            db.add(job)
+        # A NULL source is an unfinished transfer, never an importable outbox.
+        job.source_blob_name = None
+        job.dispatch_updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.commit()
-        raise HTTPException(status_code=503, detail="File storage unavailable — try again.")
-
-    # ── Commit the job BEFORE dispatching (so the worker can find it) ─────────
-    db.commit()
-
-    # ── Dispatch the background import ────────────────────────────────────────
-    from app.tasks.import_task import import_file
-    import_file.delay(job_id, blob_name, suffix, file.filename)
-
-    logger.info(f"Job {job_id} accepted for import: '{file.filename}'")
-
-    return UploadResponse(
-        job_id=    job_id,
-        file_name= file.filename,
-        file_type= suffix.lstrip("."),
-        status=    "importing",
-        message=   "File received. Import is running — poll /jobs/{job_id}/status.",
-    )
+        blob_name = f"uploads/{job_id}/source{suffix}"
+        if not _store_raw_to_blob(file.file, blob_name):
+            job.import_error = "The file transfer was interrupted. Retry the same file and request ID."
+            db.commit()
+            raise HTTPException(503, "File storage unavailable. Retry the same file to resume this upload.")
+        lease.assert_owned()
+        job.source_blob_name = blob_name
+        job.dispatch_updated_at = None
+        job.import_error = None
+        db.commit()
+        try:
+            request_dispatch(job_id, force=True)
+        except Exception:
+            logger.exception("Import publication deferred for job %s; SQL intent retained", job_id)
+        return UploadResponse(job_id=job_id, file_name=file.filename, file_type=suffix.lstrip("."),
+            status="importing", message="File received. Import is queued; poll the existing job for progress.")
+    except HTTPException:
+        raise
+    except TimeoutError as exc:
+        db.rollback()
+        raise HTTPException(503, "This upload is still transferring or ownership was interrupted. Retry the same file/request ID.",
+                            headers={"Retry-After": "3"}) from exc
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Upload request %s could not finish", job_id)
+        raise HTTPException(503, "Upload service is temporarily unavailable. Retry with the same request ID.",
+                            headers={"Retry-After": "3"}) from exc
+    finally:
+        try:
+            if guarded:
+                event.remove(db, "before_commit", lease.assert_owned)
+        finally:
+            lease.release()
 
 # ── POST /jobs/{job_id}/icp ───────────────────────────────────────────────────
 @app.post("/jobs/{job_id}/icp", status_code=status.HTTP_202_ACCEPTED)
@@ -281,6 +322,16 @@ def submit_icp(
     transaction_lock(db, "ql:dispatch:" + job_id)
     job: Job = _get_job_or_404(job_id, db)
 
+    if job.status == "running" and job.icp_prompt == body.icp_prompt.strip():
+        # Recover an accepted submission after a browser timeout; a different
+        # prompt remains forbidden while any published work can still run.
+        db.commit()
+        try:
+            request_dispatch(job_id)
+        except Exception:
+            logger.warning("Accepted processing will recover for job %s", job_id)
+        return {"job_id": job_id, "status": "running", "tasks_queued": job.total_rows or 0,
+                "message": "This processing request was already accepted."}
     if job.status not in ("queued",):
         raise HTTPException(
             status_code=409,
@@ -295,31 +346,29 @@ def submit_icp(
     job.status     = "running"
     db.flush()
 
-    # Load all lead IDs for this job
-    lead_ids = [str(r[0]) for r in db.query(Lead.id).filter(Lead.job_id == job_id).all()]
-
-    if not lead_ids:
+    lead_count = int(db.query(func.count(Lead.id)).filter(Lead.job_id == job_id).scalar() or 0)
+    if not lead_count:
         raise HTTPException(status_code=422, detail="Job has no leads to process.")
+    job.dispatch_row_index = job.dispatch_lead_id = None
+    job.dispatch_complete = False
+    job.dispatch_updated_at = None
 
     # Commit before dispatch so workers can always observe the running state.
     db.commit()
     try:
-        header = [process_lead.s(lid, job.icp_prompt) for lid in lead_ids]
-        callback = finalise_job.s(job_id)
-        chord(header)(callback)
-    except Exception as exc:
-        job.status = "queued"
-        db.commit()
-        logger.exception("Failed to dispatch job %s", job_id)
-        raise HTTPException(status_code=503, detail="Processing queue unavailable. Please retry.") from exc
+        request_dispatch(job_id, force=True)
+    except Exception:
+        # Some messages may already have been published. Never reopen the ICP
+        # form or allow a different prompt to race those in-flight tasks.
+        logger.exception("Processing publication deferred for job %s; SQL intent retained", job_id)
 
-    logger.info(f"Job {job_id}: dispatched {len(lead_ids)} tasks")
+    logger.info("Job %s accepted for paged dispatch of %s leads", job_id, lead_count)
 
     return {
         "job_id":      job_id,
         "status":      "running",
-        "tasks_queued": len(lead_ids),
-        "message":     f"Processing {len(lead_ids)} leads. Poll /jobs/{job_id}/status for progress.",
+        "tasks_queued": lead_count,
+        "message":     f"Accepted {lead_count} leads for processing. Poll /jobs/{job_id}/status for progress.",
     }
 
 
@@ -327,7 +376,7 @@ def submit_icp(
 @app.get("/jobs")
 def list_jobs(db: Session = Depends(get_db)):
     """List all jobs, newest first."""
-    jobs = db.query(Job).order_by(Job.created_at.desc()).limit(100).all()
+    jobs = db.query(Job).order_by(Job.created_at.desc(), Job.id.desc()).limit(100).all()
     return [_job_to_status(j) for j in jobs]
 
 
@@ -370,10 +419,14 @@ def dashboard_stats(db: Session = Depends(get_db)):
 @app.get("/jobs/{job_id}/status", response_model=JobStatusResponse)
 def job_status(job_id: str, db: Session = Depends(get_db)):
     job = _get_job_or_404(job_id, db)
-    try:
+    if (job.status == "importing" and job.source_blob_name or job.status == "running" and
+            (not job.dispatch_complete or job.processed_rows >= (job.total_rows or 0))):
+        db.commit()
+        try:
+            request_dispatch(str(job.id))
+        except Exception:
+            logger.warning("Job recovery will retry for %s", job_id)
         db.refresh(job)
-    except Exception as e:
-        logger.warning(f"db.refresh failed for job {job_id}: {e} — using cached state")
     return _job_to_status(job)
 
 
@@ -381,6 +434,7 @@ def job_status(job_id: str, db: Session = Depends(get_db)):
 @app.get("/jobs/{job_id}/results", response_model=PaginatedResults)
 def job_results(
     job_id: str,
+    details: bool = Query(True),
     limit:  int = Query(100, ge=1, le=500, description="Page size (max 500)."),
     offset: int = Query(0,  ge=0,          description="Rows to skip (page offset)."),
     search: Optional[str] = Query(None, max_length=100),
@@ -427,23 +481,35 @@ def job_results(
         "contact_name": Lead.contact_name,
         "email_address": Lead.email_address,
         "final_score": FinalScore.total_score,
-        "priority": FinalScore.priority,
+        "priority": case((FinalScore.priority == "High", 3), (FinalScore.priority == "Medium", 2), (FinalScore.priority == "Low", 1), else_=0),
     }
     order_column = sort_columns[sort_by]
     order = order_column.desc() if sort_dir == "desc" else order_column.asc()
+    score_loader = joinedload(Lead.final_score)
+    if not details:
+        score_loader = score_loader.load_only(FinalScore.total_score, FinalScore.icp_score,
+            FinalScore.growth_score, FinalScore.contact_score, FinalScore.priority,
+            FinalScore.qualification_status, FinalScore.scoring_version)
+    summary_load = [] if details else [load_only(Lead.id, Lead.job_id, Lead.row_index,
+        Lead.contact_name, Lead.company_name, Lead.job_title, Lead.email_address,
+        Lead.reuse_kind, Lead.reused_from_lead_id, Lead.evidence_checked_at, Lead.tracking_id)]
     leads = (
         base
         .options(
-            joinedload(Lead.job), joinedload(Lead.final_score),           # 1-to-1 → JOIN in the same query
-            selectinload(Lead.validation_results),  # 1-to-many → one extra IN() query
+            joinedload(Lead.job).load_only(Job.icp_prompt) if details else noload(Lead.job),
+            score_loader, noload(Lead.refresh_requests),
+            selectinload(Lead.validation_results) if details else noload(Lead.validation_results),
+            *summary_load,
         )
-        .order_by(order, Lead.row_index.asc(), Lead.id.asc())
+        .order_by(order, FinalScore.total_score.desc() if sort_by == "priority" else Lead.row_index.asc(), Lead.row_index.asc(), Lead.id.asc())
         .offset(offset)
         .limit(limit)
         .all()
     )
 
-    items = [_lead_to_response(lead) for lead in leads]
+    latest = latest_refreshes(db, [lead.id for lead in leads])
+    items = [_lead_to_response(lead, include_details=details,
+        latest_refresh=latest.get(str(lead.id))) for lead in leads]
 
     return PaginatedResults(
         items=    items,
@@ -465,20 +531,20 @@ def lead_result(job_id: str, lead_id: str, db: Session = Depends(get_db)):
         .filter(Lead.id == lead_id, Lead.job_id == job_id)
         .options(
             joinedload(Lead.job), joinedload(Lead.final_score),
-            selectinload(Lead.validation_results),
+            selectinload(Lead.validation_results), noload(Lead.refresh_requests),
         )
         .first()
     )
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found.")
-    return _lead_to_response(lead)
+    return _lead_to_response(lead, latest_refresh=latest_refreshes(db, [lead.id]).get(str(lead.id)))
 
 
 # ── GET /jobs/{job_id}/export/excel ──────────────────────────────────────────
 @app.patch("/jobs/{job_id}/results/{lead_id}/tracking", response_model=LeadResultResponse)
 def update_tracking(job_id: str, lead_id: str, body: TrackingUpdate,
                     db: Session = Depends(get_db)):
-    lead = db.query(Lead).filter(Lead.id == lead_id, Lead.job_id == job_id).first()
+    lead = db.query(Lead).options(noload(Lead.refresh_requests)).filter(Lead.id == lead_id, Lead.job_id == job_id).first()
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     if not lead.tracking_id:
@@ -523,76 +589,71 @@ def update_tracking(job_id: str, lead_id: str, body: TrackingUpdate,
         raise HTTPException(status_code=409, detail="Tracking changed elsewhere. Reload the lead and try again.")
     db.commit()
     db.expire_all()
-    return _lead_to_response(lead)
-
-
-@app.get("/jobs/{job_id}/export/excel")
-def export_excel(job_id: str, db: Session = Depends(get_db)):
-    """Build and STREAM the enriched .xlsx (no blob redirect → no CORS issues)."""
-    job = _get_job_or_404(job_id, db)
-    _require_completed(job)
-
-    data = build_excel_bytes(job_id, db)
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="job_{job_id}.xlsx"'},
-    )
-
-
-# ── GET /jobs/{job_id}/export/csv ─────────────────────────────────────────────
-@app.get("/jobs/{job_id}/export/csv")
-def export_csv(job_id: str, db: Session = Depends(get_db)):
-    """Build and STREAM the enriched .csv (no blob redirect → no CORS issues)."""
-    job = _get_job_or_404(job_id, db)
-    _require_completed(job)
-
-    data = build_csv_bytes(job_id, db)
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="job_{job_id}.csv"'},
-    )
+    return _lead_to_response(lead, latest_refresh=latest_refreshes(db, [lead.id]).get(str(lead.id)))
 
 
 from app.models import CompanyScrape
 
 @app.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_job(job_id: UUID, db: Session = Depends(get_db)):
+def delete_job(job_id: UUID, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     job_id = str(job_id)
     transaction_lock(db, "ql:dispatch:" + job_id)
     job = _get_job_or_404(job_id, db)
-    if job.status in ("running", "importing"):
-        raise HTTPException(status_code=409, detail="Wait for this upload to finish before deleting it.")
-    if db.query(LeadRefresh.id).join(Lead, Lead.id == LeadRefresh.lead_id).filter(
-            Lead.job_id == job_id, LeadRefresh.status.in_(("queued", "running"))).first():
-        raise HTTPException(status_code=409, detail="Wait for the active evidence refresh to finish before deleting this upload.")
+    upload_lease = None
+    if job.status == "importing" and not job.source_blob_name:
+        upload_lease = ConversationLease("upload:" + job_id)
+        try:
+            upload_lease.acquire()
+        except Exception as exc:
+            raise HTTPException(409, "The file is still transferring. Wait for it to finish before deleting.") from exc
+    elif job.status in ("running", "importing"):
+        raise HTTPException(409, "Wait for this upload to finish before deleting it.")
+    try:
+        try:
+            transaction_lock(db, "ql:artifacts:" + job_id, timeout_ms=0)
+        except RuntimeError as exc:
+            raise HTTPException(409, "Wait for active website indexing to finish before deleting this upload.") from exc
+        if db.query(LeadRefresh.id).join(Lead, Lead.id == LeadRefresh.lead_id).filter(
+                Lead.job_id == job_id, LeadRefresh.status.in_(("queued", "running"))).first():
+            raise HTTPException(409, "Wait for the active evidence refresh to finish before deleting this upload.")
+        transaction_lock(db, "ql:lead-import")
+        tracking_ids = [row[0] for row in db.query(Lead.tracking_id).filter(
+            Lead.job_id == job_id, Lead.tracking_id.isnot(None)).distinct().all()]
+        lead_ids = db.query(Lead.id).filter(Lead.job_id == job_id)
+        # Explicit set-based deletes avoid loading every lead, score, validation,
+        # refresh and log just to perform ORM cascades on a large upload.
+        for model in (ProcessingLog, LLMCallLog):
+            db.query(model).filter(or_(model.job_id == job_id, model.lead_id.in_(lead_ids))).delete(synchronize_session=False)
+        for model in (CompanyScrape, ValidationResult, FinalScore, LeadRefresh):
+            db.query(model).filter(model.lead_id.in_(lead_ids)).delete(synchronize_session=False)
+        conversations = db.query(ChatConversation.id).filter(ChatConversation.job_id == job_id)
+        db.query(ChatMessage).filter(or_(ChatMessage.job_id == job_id,
+            ChatMessage.conversation_id.in_(conversations))).delete(synchronize_session=False)
+        db.query(ChatConversation).filter(ChatConversation.job_id == job_id).delete(synchronize_session=False)
+        db.query(Lead).filter(Lead.job_id == job_id).delete(synchronize_session=False)
+        db.query(Job).filter(Job.id == job_id).delete(synchronize_session=False)
+        for start in range(0, len(tracking_ids), 500):
+            db.query(LeadTracking).filter(LeadTracking.id.in_(tracking_ids[start:start + 500]),
+                ~db.query(Lead.id).filter(Lead.tracking_id == LeadTracking.id).exists()
+            ).delete(synchronize_session=False)
+        if upload_lease:
+            upload_lease.assert_owned()
+        db.commit()
+    finally:
+        if upload_lease:
+            upload_lease.release()
+    # Never remove files/vectors before the SQL deletion commits successfully.
+    # Best-effort remote cleanup also must not hold locks or delay the response.
+    background_tasks.add_task(_cleanup_deleted_job_artifacts, job_id)
+    logger.info("Job %s deleted", job_id)
 
+
+def _cleanup_deleted_job_artifacts(job_id: str):
     try:
         qdrant_delete_job(job_id)
-    except Exception as e:
-        logger.warning(f"Failed to delete Qdrant vectors for job {job_id}: {e}")
+    except Exception:
+        logger.warning("Vector cleanup failed for deleted job %s", job_id)
     _delete_job_blobs(job_id)
-
-    # Bulk delete — avoids ORM's uselist=False assumption missing duplicate rows
-    db.query(CompanyScrape).filter(
-        CompanyScrape.lead_id.in_(
-            db.query(Lead.id).filter(Lead.job_id == job_id)
-        )
-    ).delete(synchronize_session=False)
-
-    transaction_lock(db, "ql:lead-import")
-    tracking_ids = [row[0] for row in db.query(Lead.tracking_id).filter(
-        Lead.job_id == job_id, Lead.tracking_id.isnot(None)).distinct().all()]
-    db.delete(job)
-    db.flush()
-    for start in range(0, len(tracking_ids), 500):
-        db.query(LeadTracking).filter(
-            LeadTracking.id.in_(tracking_ids[start:start + 500]),
-            ~db.query(Lead.id).filter(Lead.tracking_id == LeadTracking.id).exists(),
-        ).delete(synchronize_session=False)
-    logger.info(f"Job {job_id} deleted")
-
 
 @app.get("/jobs/{job_id}/token-report")
 def token_report(job_id: str, db: Session = Depends(get_db)):
@@ -701,6 +762,7 @@ def _job_to_status(job: Job) -> JobStatusResponse:
         progress_pct=       job.progress_pct,
         duplicates_removed= getattr(job, "duplicates_removed", None),
         import_error=       getattr(job, "import_error", None),
+        upload_pending=job.status == "importing" and not job.source_blob_name,
         created_at=         _to_ist(job.created_at),        # ← convert
         completed_at=       _to_ist(job.completed_at),      # ← convert
         llm_model=          getattr(job, "llm_model", None),
@@ -727,19 +789,22 @@ def _upload_source_file(raw: bytes, job_id: str, filename: str, suffix: str) -> 
     except Exception as e:
         logger.warning(f"Failed to upload source file for job {job_id}: {e}")
 
-def _store_raw_to_blob(raw: bytes, blob_name: str) -> bool:
+def _store_raw_to_blob(raw, blob_name: str) -> bool:
     """Upload raw bytes to Blob at the given name. Returns True on success."""
     try:
-        client = BlobServiceClient.from_connection_string(settings.AZURE_BLOB_CONNECTION_STRING)
-        container = client.get_container_client(settings.AZURE_BLOB_CONTAINER)
-        try:
-            container.get_container_properties()
-        except Exception:
+        from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+        with BlobServiceClient.from_connection_string(settings.AZURE_BLOB_CONNECTION_STRING,
+                connection_timeout=10, read_timeout=60, retry_total=3,
+                max_single_put_size=4 * 1024 * 1024, max_block_size=4 * 1024 * 1024) as client:
+            container = client.get_container_client(settings.AZURE_BLOB_CONTAINER)
             try:
-                container.create_container()
-            except Exception:
-                pass
-        container.get_blob_client(blob_name).upload_blob(raw, overwrite=True)
+                container.get_container_properties()
+            except ResourceNotFoundError:
+                try:
+                    container.create_container()
+                except ResourceExistsError:
+                    pass
+            container.get_blob_client(blob_name).upload_blob(raw, overwrite=True, max_concurrency=2)
         return True
     except Exception as e:
         logger.error(f"_store_raw_to_blob failed for '{blob_name}': {e}")
@@ -749,12 +814,18 @@ def _store_raw_to_blob(raw: bytes, blob_name: str) -> bool:
 def _delete_job_blobs(job_id: str) -> None:
     """Best-effort cleanup of source, scrape, and export objects for a job."""
     try:
-        client = BlobServiceClient.from_connection_string(settings.AZURE_BLOB_CONNECTION_STRING)
-        container = client.get_container_client(settings.AZURE_BLOB_CONTAINER)
-        for prefix in (f"uploads/{job_id}/", f"scraped/{job_id}/", f"exports/{job_id}/"):
-            names = [blob.name for blob in container.list_blobs(name_starts_with=prefix)]
-            for start in range(0, len(names), 256):
-                container.delete_blobs(*names[start:start + 256])
+        with BlobServiceClient.from_connection_string(settings.AZURE_BLOB_CONNECTION_STRING,
+                connection_timeout=10, read_timeout=60, retry_total=2) as client:
+            container = client.get_container_client(settings.AZURE_BLOB_CONTAINER)
+            for prefix in (f"uploads/{job_id}/", f"scraped/{job_id}/", f"exports/{job_id}/"):
+                names = []
+                for blob in container.list_blobs(name_starts_with=prefix):
+                    names.append(blob.name)
+                    if len(names) == 256:
+                        container.delete_blobs(*names)
+                        names = []
+                if names:
+                    container.delete_blobs(*names)
     except Exception as exc:
         logger.warning("Blob cleanup failed for job %s: %s", job_id, exc)
 
@@ -766,11 +837,13 @@ def _login_allowed(request: Request, username: str) -> bool:
         import redis
         ip = request.client.host if request.client else "unknown"
         digest = hashlib.sha256(f"{ip}|{username.lower()}".encode()).hexdigest()
-        client = redis.Redis.from_url(settings.REDIS_URL)
+        client = redis.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=3, socket_timeout=3)
         key = f"ql:login:{digest}"
-        attempts = client.incr(key)
-        if attempts == 1:
-            client.expire(key, 60)
+        attempts = client.eval("""
+            local n=redis.call('INCR',KEYS[1])
+            if n == 1 or redis.call('TTL',KEYS[1]) < 0 then redis.call('EXPIRE',KEYS[1],60) end
+            return n
+        """, 1, key)
         return attempts <= 10
     except Exception as exc:
         logger.debug("Login throttle unavailable: %s", exc)

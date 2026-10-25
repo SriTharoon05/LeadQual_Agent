@@ -97,6 +97,7 @@ class WebResearchResult:
     employee_count_confirmed: bool = False
     technologies_found: list[str] = field(default_factory=list)
     growth_signals: str = ""
+    growth_evidence: dict = field(default_factory=dict)
     company_summary: str = ""
     company_description: str = ""   # → col 19
     technologies_used: str = ""     # → col 20
@@ -114,6 +115,7 @@ class WebResearchResult:
             "employee_count_confirmed": self.employee_count_confirmed,
             "technologies_found":       self.technologies_found,
             "growth_signals":           self.growth_signals,
+            "growth_evidence": self.growth_evidence,
             "company_summary":          self.company_summary,
             "company_description":      self.company_description,
             "technologies_used":        self.technologies_used,
@@ -162,6 +164,8 @@ Never invent a value, quotation, source URL, revenue currency, or date.
 Distinguish annual revenue from funding/valuation, HQ from contact location,
 and current employment from a historical mention. Conflicting sources are conflicting;
 unavailable/private profiles and no search result mean unclear, never former.
+Research reference time (UTC): {utc_checked_at()}.
+Interpret recent events and the last 24 months relative to this date.
 
 LEAD CONTEXT:
   Company:        {company}
@@ -174,7 +178,7 @@ LEAD CONTEXT:
 1. COMPANY OVERVIEW — verify employees, revenue range, industry. Confirm or correct the LEAD CONTEXT above.
 2. PERSON VERIFY — confirm this person works at this company in this role. If a LinkedIn URL is provided treat it as strong evidence — visit/verify it. Set person_verified=true if LinkedIn OR another credible source confirms employment.
 3. TECH STACK — find software, platforms, tools this company uses (job postings, G2/Capterra, BuiltWith, their site).
-4. GROWTH SIGNALS — find recent, dated signals: funding, headcount growth, new offices, product launches, acquisitions, or executive hires. Prefer the last 24 months and state dates when available.
+4. GROWTH SIGNALS — find dated hiring, expansion, technology investment, funding, acquisitions, product launches or leadership changes from the last 24 months. A standing careers page or an old acquisition alone is not evidence of current demand.
 5. COMPANY DESCRIPTION — write a 2–3 sentence plain-English description of what this company does, who their customers are, and their value proposition.
 
 Also return an "evidence" object with ALL these keys:
@@ -186,6 +190,15 @@ own source that supports that value; do not attach generic homepages as proof.
 For employment value use current, former, or unclear. Only call former with explicit
 evidence of departure; record dates in explanation. For unclear, value is null and
 sources is []. Revenue needs a currency and reporting period if available.
+For seniority, value MUST include the complete current job title AND function,
+not just VP/Director/Manager. Keep the person's function distinct from their tier.
+Also return growth_evidence with signals: a list of objects with kind
+(hiring|expansion|technology_investment|funding|acquisition|product_launch|leadership_change),
+date (actual event date YYYY-MM-DD, never the search date), relevant (boolean),
+summary, and sources [{{url,title,excerpt}}]. Relevant means resource, operational
+or technology demand, not generic promotional prose. Include only positive,
+source-backed events, exact excerpts and consulted URLs. Omit undated events;
+never invent dates. Return signals:[] when no supported event was found.
 
 Return JSON including "evidence" plus these keys:
 {{
@@ -293,6 +306,8 @@ def _merge(partials: list[dict], sources: list[str]) -> WebResearchResult:
     combined = next((p for p in partials if isinstance(p, dict)), {})
     result.evidence = normalize_evidence(combined.get("evidence"), result.sources)
     result.checked_at = utc_checked_at()
+    from app.validators.evidence import normalize_growth
+    result.growth_evidence = normalize_growth(combined.get("growth_evidence"), result.sources, result.checked_at)
     employment = result.evidence["employment"]
     result.employment_status = employment["value"] if employment["status"] == "confirmed" else "unclear"
     result.person_verified = result.employment_status == "current"

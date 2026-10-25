@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     MAX_WORKERS: int = 10
     CELERY_IMPORT_QUEUE: str = "lead_imports"
     CELERY_EMBED_QUEUE: str = "lead_embeddings"
+    CELERY_EXPORT_QUEUE: str = "lead_exports"
+    EXPORT_BATCH_SIZE: int = Field(default=250, ge=50, le=1000)
+    EXPORT_CACHE_SECONDS: int = Field(default=600, ge=60, le=3600)
+    EXPORT_TIMEOUT_SECONDS: int = Field(default=1800, ge=120, le=7200)
+    SCRAPE_MAX_HTML_BYTES: int = Field(default=2_097_152, ge=65_536, le=8_388_608)
+    SCRAPE_MAX_TEXT_CHARS: int = Field(default=250_000, ge=4_000, le=1_000_000)
 
     # ── App ───────────────────────────────────────────────────────────────────
     APP_ENV: str = "development"
@@ -80,8 +86,10 @@ class Settings(BaseSettings):
 # ── Singleton ─────────────────────────────────────────────────────────────────
 settings = Settings()
 
-if settings.APP_ENV.lower() == "production" and settings.AUTH_SECRET_KEY == "change-me-in-production":
-    raise RuntimeError("AUTH_SECRET_KEY must be configured in production")
+if settings.APP_ENV.lower() in {"production", "prod"} and (
+        len(settings.AUTH_SECRET_KEY.encode("utf-8")) < 32
+        or settings.AUTH_SECRET_KEY in {"change-me-in-production", "replace-with-at-least-32-random-bytes"}):
+    raise RuntimeError("Configure AUTH_SECRET_KEY with at least 32 random bytes in production")
 
 
 # ── Canonical 29 output columns (order matters — matches Excel template) ─────
@@ -134,16 +142,16 @@ COLUMN_GROUPS: Dict[str, List[str]] = {
 # Extra AI/validation columns appended after the 29 in the export
 EXPORT_EXTRA_COLUMNS: List[str] = [
     "ICP Score",
-    "Decision Maker Score",
-    "Web Validation Score",
-    "Contact Quality Score",
+    "Contact Score",
+    "Growth Score",
     "Final Score",
     "Priority",
     "Reasoning",
     "Growth Signals",
     "Outreach Intelligence",
     "Source URLs",
-    "Validation Status",
+    "Qualification Status",
+    "Scoring Version",
 ]
 
 
@@ -311,12 +319,13 @@ LEAD_SOURCE_DEFAULT: str = "ZoomInfo"
 
 
 # ── Scoring weights (must sum to 1.0) ────────────────────────────────────────
+from app.scoring.policy import WEIGHTS as _QUALIFICATION_WEIGHTS
+
+# Compatibility names for callers; scoring.policy is the source of truth.
 SCORING_WEIGHTS: Dict[str, float] = {
-    "icp_fit":          0.30,
-    "decision_maker":   0.25,
-    "data_accuracy":    0.25,
-    "growth_signals":   0.15,
-    "contact_quality":  0.05,
+    "icp_fit":          _QUALIFICATION_WEIGHTS["icp"],
+    "growth_signals":   _QUALIFICATION_WEIGHTS["growth"],
+    "contact_quality":  _QUALIFICATION_WEIGHTS["contact"],
 }
 
 # ── Priority tiers (inclusive ranges) ────────────────────────────────────────
@@ -348,7 +357,6 @@ WEB_SEARCH_QUERIES: Dict[str, str] = {
 
 def get_priority(score: float) -> str:
     """Return priority tier label for a given score."""
-    for label, (low, high) in PRIORITY_TIERS.items():
-        if low <= score <= high:
-            return label
-    return "Low"
+    # Lower bounds avoid gaps such as 79.1..79.9 falling through to Low.
+    from app.scoring.policy import priority_for
+    return priority_for(score)

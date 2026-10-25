@@ -6,9 +6,10 @@ import uuid
 from urllib.parse import urlsplit
 
 from sqlalchemy import exists, or_, text
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, noload, load_only
 
-from app.models import FinalScore, Lead, LeadRefresh, LeadTracking, ValidationResult
+from app.models import CompanyScrape, FinalScore, Job, Lead, LeadRefresh, LeadTracking, ValidationResult
+from app.scoring.policy import SCORING_VERSION
 
 
 def normalized(value):
@@ -66,16 +67,19 @@ def fingerprints(record):
     }
 
 
-def transaction_lock(db, resource):
+def transaction_lock(db, resource, *, mode="Exclusive", timeout_ms=30000):
     """Serialize short identity/import transactions across API and workers."""
     if db.bind.dialect.name == "mssql":
+        if mode not in {"Exclusive", "Shared"}:
+            raise ValueError("Unsupported database lock mode")
         code = db.execute(text("""
             SET NOCOUNT ON;
             DECLARE @result int;
-            EXEC @result = sp_getapplock @Resource=:resource, @LockMode='Exclusive',
-                 @LockOwner='Transaction', @LockTimeout=30000;
+            EXEC @result = sp_getapplock @Resource=:resource, @LockMode=:mode,
+                 @LockOwner='Transaction', @LockTimeout=:timeout_ms;
             SELECT @result;
-        """), {"resource": resource}).scalar()
+        """), {"resource": resource, "mode": mode,
+                 "timeout_ms": max(0, min(int(timeout_ms), 30000))}).scalar()
         if code is None or code < 0:
             raise RuntimeError("Could not acquire database import lock")
 
@@ -84,13 +88,17 @@ def matching_lead(db, keys):
     predicates = [getattr(Lead, key) == value for key, value in keys.items() if value]
     if not predicates:
         return None
-    candidates = db.query(Lead).filter(or_(*predicates)).order_by(Lead.created_at.desc(), Lead.id).all()
+    # Matching needs only identifiers. Loading Lead objects would also fetch
+    # owner joins and every refresh history for every historical duplicate.
+    candidates = db.query(Lead.tracking_id, *(
+        getattr(Lead, key) for key in KEY_FIELDS
+    )).filter(or_(*predicates)).distinct().all()
     # Conflicting strong identifiers are ambiguous: never merge them silently.
     valid = [lead for lead in candidates if not any(
         keys[key] and getattr(lead, key) and keys[key] != getattr(lead, key)
         for key in KEY_FIELDS[:3])]
     groups = {str(lead.tracking_id) for lead in valid if lead.tracking_id}
-    return valid[0] if valid and len(groups) <= 1 else None
+    return next((lead for lead in valid if lead.tracking_id), None) if len(groups) == 1 else None
 
 
 def assign_identity(db, record):
@@ -120,14 +128,16 @@ def assign_identities(db, records):
             if values:
                 predicates.append(getattr(Lead, field).in_(values))
         if predicates:
-            existing = (db.query(Lead).filter(or_(*predicates))
-                        .order_by(Lead.created_at.desc(), Lead.id).all())
+            existing = (db.query(Lead.tracking_id, *(
+                            getattr(Lead, key) for key in KEY_FIELDS)).filter(or_(*predicates))
+                        .distinct().all())
             for lead in existing:
                 candidate = {field: getattr(lead, field) for field in KEY_FIELDS}
                 candidate["tracking_id"] = lead.tracking_id
+                alias_id = "|".join(str(candidate.get(field) or "") for field in ("tracking_id", *KEY_FIELDS))
                 for field in KEY_FIELDS:
                     if candidate[field]:
-                        aliases.setdefault((field, candidate[field]), {})[str(lead.id)] = candidate
+                        aliases.setdefault((field, candidate[field]), {})[alias_id] = candidate
         for record, keys in zip(batch, keys_by_row):
             candidates = {}
             for field in KEY_FIELDS:
@@ -152,32 +162,39 @@ def reusable_lead(db, lead, icp_prompt):
     """Only finished results in the same person/company/role context qualify."""
     if not lead.tracking_id or not lead.research_fingerprint:
         return None, None
-    candidates = (db.query(Lead).filter(
+    candidates = db.query(Lead).filter(
         Lead.tracking_id == lead.tracking_id, Lead.id != lead.id,
         or_(Lead.processing_status == "completed", exists().where(
             LeadRefresh.lead_id == Lead.id, LeadRefresh.status == "completed")),
         ~exists().where(LeadRefresh.lead_id == Lead.id,
                         LeadRefresh.status.in_(("queued", "running"))),
         Lead.research_fingerprint == lead.research_fingerprint,
-    ).options(selectinload(Lead.validation_results), selectinload(Lead.final_score),
-              selectinload(Lead.job)).order_by(
-                  Lead.evidence_checked_at.desc(), Lead.created_at.desc(), Lead.id).all())
-    for candidate in candidates:
-        stages = {v.stage: v for v in candidate.validation_results}
-        if not candidate.final_score or not {"icp", "web", "contact"}.issubset(stages):
-            continue
-        # Failures masquerading as safe defaults must not become reusable evidence.
-        if any(json_object(v.raw_output).get("error") for v in stages.values()):
-            continue
-        if (candidate.input_fingerprint == lead.input_fingerprint
-                and normalized(candidate.job.icp_prompt) == normalized(icp_prompt)):
-            return candidate, "full"
-        # Legacy research without structured evidence cannot validate a new ICP.
-        evidence = json_object(stages["web"].raw_output).get("evidence")
-        if isinstance(evidence, dict) and evidence:
-            # Fresh research takes precedence over an older score for a matching
-            # ICP: score the new evidence instead of restoring outdated facts.
-            return candidate, "research"
+    ).options(
+        load_only(Lead.id, Lead.job_id, Lead.input_fingerprint, Lead.reused_from_lead_id,
+                  Lead.company_description, Lead.technologies_used, Lead.evidence_checked_at),
+        noload(Lead.tracking), noload(Lead.refresh_requests),
+        selectinload(Lead.validation_results), selectinload(Lead.final_score),
+        selectinload(Lead.job).load_only(Job.icp_prompt)
+    ).order_by(Lead.evidence_checked_at.desc(), Lead.created_at.desc(), Lead.id)
+    offset = 0
+    while True:
+        batch = candidates.offset(offset).limit(20).all()
+        if not batch:
+            break
+        for candidate in batch:
+            stages = {v.stage: v for v in candidate.validation_results}
+            if not candidate.final_score or not {"icp", "web", "contact"}.issubset(stages):
+                continue
+            if any(json_object(v.raw_output).get("error") for v in stages.values()):
+                continue
+            if (candidate.input_fingerprint == lead.input_fingerprint
+                    and normalized(candidate.job.icp_prompt) == normalized(icp_prompt)
+                    and candidate.final_score.scoring_version == SCORING_VERSION):
+                return candidate, "full"
+            evidence = json_object(stages["web"].raw_output).get("evidence")
+            if isinstance(evidence, dict) and evidence:
+                return candidate, "research"
+        offset += len(batch)
     return None, None
 
 
@@ -197,9 +214,28 @@ def copy_result(db, source, target):
                 "stage", "passed", "score", "reasoning", "raw_output", "sources_json", "created_at")}))
     db.add(FinalScore(lead_id=target.id, **{
         column.name: getattr(source.final_score, column.name)
-        for column in FinalScore.__table__.columns if column.name not in {"id", "lead_id"}}))
+        for column in FinalScore.__table__.columns if column.name not in {"id", "lead_id", "scoring_audit_json"}}))
     target.company_description = source.company_description
     target.technologies_used = source.technologies_used
     target.evidence_checked_at = source.evidence_checked_at
     target.reused_from_lead_id = source.reused_from_lead_id or source.id
     target.reuse_kind = "full"
+    # Job-scoped chat must not depend on the source upload surviving deletion.
+    # Copy saved prose/date; indexing the new scope does not rerun qualification
+    # or web research. The durable ingestion outbox publishes after commit.
+    document = db.query(CompanyScrape).filter(CompanyScrape.lead_id == source.id).order_by(
+        CompanyScrape.scraped_at.desc(), CompanyScrape.id.desc()).first()
+    if (document and document.clean_text and (source.evidence_checked_at is None
+            or document.scraped_at >= source.evidence_checked_at)):
+        target_document = db.query(CompanyScrape).filter(CompanyScrape.lead_id == target.id).order_by(
+            CompanyScrape.scraped_at.desc(), CompanyScrape.id.desc()).first()
+        if target_document is None:
+            target_document = CompanyScrape(job_id=target.job_id, lead_id=target.id)
+            db.add(target_document)
+        if (not target_document.clean_text or target_document.scraped_at is None
+                or target_document.scraped_at < document.scraped_at):
+            for field in ("company_name", "website_url", "clean_text", "blob_path", "scraped_at"):
+                setattr(target_document, field, getattr(document, field))
+            target_document.embedded, target_document.chunk_count = 0, 0
+            target_document.ingest_status, target_document.ingest_attempts = "embedding", 0
+            target_document.ingest_dispatched_at, target_document.ingest_error = None, None

@@ -21,13 +21,16 @@ export function FollowUpReminders() {
   const [page, setPage] = useState(0);
   const [selected, setSelected] = useState<{ jobId: string; lead: LeadResult } | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
+  const savingRef = useRef(false);
   const opening = useRef(0);
+  const detailRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => { opening.current++; detailRequest.current?.abort(); }, []);
   const qc = useQueryClient();
   const { toast } = useToast();
   const team = useQuery({ queryKey: ['workspace-team'], queryFn: getTeam });
   const reminders = useQuery({
     queryKey: ['workspace-reminders', status, owner, page],
-    queryFn: () => getReminders(status, page * PAGE_SIZE, PAGE_SIZE, owner),
+    queryFn: ({ signal }) => getReminders(status, page * PAGE_SIZE, PAGE_SIZE, owner, signal),
     refetchInterval: 60_000,
   });
   const total = reminders.data?.total || 0;
@@ -41,13 +44,17 @@ export function FollowUpReminders() {
 
   const openLead = async (item: WorkspaceLead) => {
     const request = ++opening.current;
+    detailRequest.current?.abort();
+    const controller = new AbortController();
+    detailRequest.current = controller;
     try {
-      const lead = await getLeadDetail(item.job_id, item.lead_id);
+      const lead = await getLeadDetail(item.job_id, item.lead_id, controller.signal);
       if (request === opening.current) setSelected({ jobId: item.job_id, lead });
     } catch { if (request === opening.current) toast('Could not load this lead', 'error'); }
   };
   const complete = async (item: WorkspaceLead) => {
-    if (saving) return;
+    if (savingRef.current) return;
+    savingRef.current = true;
     setSaving(item.lead_id);
     try {
       await updateLeadTracking(item.job_id, item.lead_id, { version: item.tracking_version, follow_up_completed: true });
@@ -56,7 +63,7 @@ export function FollowUpReminders() {
     } catch (cause) {
       toast(isAxiosError(cause) && cause.response?.status === 409 ? 'This lead changed elsewhere. Latest reminders are loaded; review and try again.' : 'Could not complete this follow-up', 'error');
       await reminders.refetch();
-    } finally { setSaving(null); }
+    } finally { savingRef.current = false; setSaving(null); }
   };
   return <Card className="p-5 space-y-4">
     <div className="flex flex-wrap items-center justify-between gap-3">

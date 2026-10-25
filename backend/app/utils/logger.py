@@ -27,6 +27,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app.database import SessionLocal, engine
 from app.models import ProcessingLog
 
 # Standard Python logger (goes to stdout / your log aggregator)
@@ -146,8 +147,28 @@ class PipelineLogger:
                 level=level,
                 message=_safe_str(message)[:MAX_DB_MESSAGE_CHARS],
             )
-            self._db.add(entry)
-            self._db.flush()   # write immediately without closing the transaction
+            # Never enlist logs in the business transaction. A flush here used
+            # to retain FK locks throughout DNS/AI waits and could leave the
+            # caller's Session unusable after a best-effort logging failure.
+            with engine.connect() as connection:
+                try:
+                    # A caller can still hold an uncommitted parent-row write.
+                    # Logging must not wait indefinitely for that same caller.
+                    connection.exec_driver_sql("SET LOCK_TIMEOUT 1000")
+                    connection.commit()
+                    with SessionLocal(bind=connection) as log_db:
+                        log_db.add(entry)
+                        log_db.commit()
+                finally:
+                    try:
+                        connection.rollback()
+                        # SQL Server SET options survive transaction rollback;
+                        # restore the default before returning this socket.
+                        connection.exec_driver_sql("SET LOCK_TIMEOUT -1")
+                        connection.commit()
+                    except Exception:
+                        connection.invalidate()
+                        raise
         except Exception as e:
             # Never let logging blow up the pipeline.
             try:

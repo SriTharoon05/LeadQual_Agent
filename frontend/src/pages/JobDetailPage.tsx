@@ -1,4 +1,5 @@
-import { lazy, Suspense, useState, useEffect, useDeferredValue, useRef } from 'react';
+import { lazy, Suspense, useState, useEffect, useRef } from 'react';
+import { useDebouncedValue } from '@/hooks/useDebouncedValue';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { motion } from 'framer-motion';
@@ -18,7 +19,8 @@ import { Input, Label, Textarea } from '@/components/ui/Input';
 import { TableSkeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/pages/DashboardPage';
 import { useToast } from '@/components/ui/Toast';
-import { getJobStatus, getResultsPage, getJobs, deleteJob, downloadExport, startIcp, getLeadDetail } from '@/api/endpoints';
+import { getJobStatus, getResultsPage, deleteJob, startIcp, getLeadDetail } from '@/api/endpoints';
+import { useExports } from '@/components/ExportManager';
 import { dash, fmtDate, safeArr } from '@/lib/format';
 import type { LeadResult, Priority } from '@/types';
 
@@ -42,6 +44,7 @@ function JobDetailContent({ jobId }: { jobId: string }) {
   const navigate = useNavigate();
   const { toast } = useToast();
   const qc = useQueryClient();
+  const exports = useExports();
 
   const [search, setSearch] = useState('');
   const [priorityFilter, setPriorityFilter] = useState<Priority | 'all'>('all');
@@ -52,13 +55,16 @@ function JobDetailContent({ jobId }: { jobId: string }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [resumeIcp, setResumeIcp] = useState('');
   const [starting, setStarting] = useState(false);
+  const startingRef = useRef(false);
   const opening = useRef(0);
-  const deferredSearch = useDeferredValue(search.trim());
+  const detailRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => { opening.current++; detailRequest.current?.abort(); }, []);
+  const deferredSearch = useDebouncedValue(search.trim());
 
   // ── Job status (live poll while running) ──────────────────────────────────
-  const { data: status } = useQuery({
+  const { data: status, isPending: statusLoading, isError: statusError, refetch: reloadStatus } = useQuery({
     queryKey: ['job-status', jobId],
-    queryFn: () => getJobStatus(jobId),
+    queryFn: ({ signal }) => getJobStatus(jobId, signal),
     refetchInterval: (q) => {
       const s = q.state.data?.status;
       return s === 'completed' || s === 'failed' || s === 'import_failed' ? false : 3000;
@@ -76,13 +82,18 @@ function JobDetailContent({ jobId }: { jobId: string }) {
     data: pageResult,
     isLoading,
     isFetching,
+    isError: resultsError,
+    isPlaceholderData,
+    refetch: reloadResults,
   } = useQuery({
     queryKey: ['job-results', jobId, page, PAGE_SIZE, deferredSearch, priorityFilter, sortKey, sortDir],
-    queryFn: () => getResultsPage(jobId, page * PAGE_SIZE, PAGE_SIZE, {
+    queryFn: ({ signal }) => getResultsPage(jobId, page * PAGE_SIZE, PAGE_SIZE, {
       search: deferredSearch, priority: priorityFilter, sortBy: sortKey, sortDir,
-    }),
+    }, signal),
     enabled: isCompleted || status?.status === 'failed',
-    placeholderData: (prev) => prev,       // ← keep old rows visible → no flicker
+    placeholderData: (prev, previousQuery) => previousQuery?.queryKey[4] === deferredSearch
+      && previousQuery.queryKey[5] === priorityFilter && previousQuery.queryKey[6] === sortKey
+      && previousQuery.queryKey[7] === sortDir ? prev : undefined,
     refetchOnWindowFocus: false,
   });
 
@@ -90,30 +101,26 @@ function JobDetailContent({ jobId }: { jobId: string }) {
   const total = pageResult?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages - 1);
+  useEffect(() => {
+    if (pageResult && !isPlaceholderData && page >= totalPages) setPage(Math.max(0, totalPages - 1));
+  }, [pageResult, page, totalPages, isPlaceholderData]);
 
   // ── Prefetch the next N pages so "Next" feels instant ─────────────────────
   useEffect(() => {
-    if (!isCompleted) return;
+    if (!isCompleted || search.trim() !== deferredSearch) return;
     for (let i = 1; i <= PREFETCH_AHEAD; i++) {
       const next = currentPage + i;
       if (next >= totalPages) break;
       qc.prefetchQuery({
         queryKey: ['job-results', jobId, next, PAGE_SIZE, deferredSearch, priorityFilter, sortKey, sortDir],
-        queryFn: () => getResultsPage(jobId, next * PAGE_SIZE, PAGE_SIZE, {
+        queryFn: ({ signal }) => getResultsPage(jobId, next * PAGE_SIZE, PAGE_SIZE, {
           search: deferredSearch, priority: priorityFilter, sortBy: sortKey, sortDir,
-        }),
+        }, signal),
       });
     }
-  }, [currentPage, totalPages, isCompleted, jobId, qc, deferredSearch, priorityFilter, sortKey, sortDir]);
+  }, [currentPage, totalPages, isCompleted, jobId, qc, deferredSearch, search, priorityFilter, sortKey, sortDir]);
 
-  // ── Job meta (filename) ───────────────────────────────────────────────────
-  const { data: jobs = [] } = useQuery({
-    queryKey: ['jobs'],
-    queryFn: getJobs,
-    placeholderData: (prev) => prev,
-    refetchOnWindowFocus: false,
-  });
-  const fileName = status?.file_name ?? jobs.find((j) => j.job_id === jobId)?.file_name ?? null;
+  const fileName = status?.file_name ?? null;
 
   const filtered = safeArr(results);
 
@@ -129,8 +136,11 @@ function JobDetailContent({ jobId }: { jobId: string }) {
 
   const openLead = async (lead: LeadResult) => {
     const request = ++opening.current;
+    detailRequest.current?.abort();
+    const controller = new AbortController();
+    detailRequest.current = controller;
     try {
-      const fresh = await getLeadDetail(jobId, lead.lead_id);
+      const fresh = await getLeadDetail(jobId, lead.lead_id, controller.signal);
       if (request === opening.current) { setSelectedLead(fresh); setDrawerOpen(true); }
     } catch { if (request === opening.current) toast('Could not load lead details', 'error'); }
   };
@@ -153,21 +163,13 @@ function JobDetailContent({ jobId }: { jobId: string }) {
     }
   };
 
-  const handleExport = async (format: 'excel' | 'csv') => {
-    try {
-      await downloadExport(jobId, format);
-      toast(`${format === 'excel' ? 'Excel' : 'CSV'} downloaded`, 'success');
-    } catch {
-      toast('Export failed', 'error');
-    }
-  };
-
   const handleRefresh = () => {
     qc.invalidateQueries({ queryKey: ['job-results', jobId] });
   };
 
   const handleStartIcp = async () => {
-    if (!resumeIcp.trim()) return;
+    if (!resumeIcp.trim() || startingRef.current) return;
+    startingRef.current = true;
     setStarting(true);
     try {
       await startIcp(jobId, resumeIcp.trim());
@@ -175,8 +177,17 @@ function JobDetailContent({ jobId }: { jobId: string }) {
       await qc.invalidateQueries({ queryKey: ['job-status', jobId] });
       await qc.invalidateQueries({ queryKey: ['jobs'] });
     } catch {
-      toast('Could not start processing. Refresh and try again.', 'error');
+      try {
+        const current = await getJobStatus(jobId);
+        if (['running', 'completed', 'failed'].includes(current.status)) {
+          qc.setQueryData(['job-status', jobId], current);
+          toast('Processing was accepted. The current status is now loaded.', 'info');
+          return;
+        }
+      } catch { /* Retain the ICP draft for a deliberate retry. */ }
+      toast('Could not confirm processing. Reload the upload status before trying again.', 'error');
     } finally {
+      startingRef.current = false;
       setStarting(false);
     }
   };
@@ -194,6 +205,8 @@ function JobDetailContent({ jobId }: { jobId: string }) {
         <Link to="/dashboard" className="inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-brand-600 transition-colors">
           <ArrowLeft className="h-4 w-4" /> Back to Dashboard
         </Link>
+
+        {statusError && <div role="alert" className="rounded-xl bg-rose-50 p-4 text-sm text-rose-700">Could not load this upload. <button className="underline" onClick={() => void reloadStatus()}>Retry</button></div>}
 
         {/* Job header */}
         <Card className="p-6">
@@ -216,12 +229,12 @@ function JobDetailContent({ jobId }: { jobId: string }) {
                 onClick={handleRefresh}>
                 Refresh
               </Button>
-              <Button size="sm" variant="ghost" icon={<FileSpreadsheet className="h-4 w-4 text-emerald-600" />}
-                onClick={() => handleExport('excel')} disabled={!isCompleted}>
+              <Button size="sm" variant="ghost" icon={exports.isBusy(jobId, 'excel') ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSpreadsheet className="h-4 w-4 text-emerald-600" />}
+                onClick={() => exports.start(jobId, 'excel')} disabled={!isCompleted || exports.isBusy(jobId, 'excel')}>
                 Excel
               </Button>
-              <Button size="sm" variant="ghost" icon={<FileText className="h-4 w-4 text-sky-600" />}
-                onClick={() => handleExport('csv')} disabled={!isCompleted}>
+              <Button size="sm" variant="ghost" icon={exports.isBusy(jobId, 'csv') ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4 text-sky-600" />}
+                onClick={() => exports.start(jobId, 'csv')} disabled={!isCompleted || exports.isBusy(jobId, 'csv')}>
                 CSV
               </Button>
               <Button size="sm" variant="danger" icon={<Trash2 className="h-3.5 w-3.5" />} onClick={handleDelete}>
@@ -291,6 +304,7 @@ function JobDetailContent({ jobId }: { jobId: string }) {
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
                 <Input
                   placeholder="Search all leads…"
+                  maxLength={100}
                   value={search}
                   onChange={(e) => { setSearch(e.target.value); setPage(0); }}
                   className="pl-9 sm:w-56"
@@ -309,7 +323,9 @@ function JobDetailContent({ jobId }: { jobId: string }) {
             </div>
           </div>
 
-          {isLoading ? (
+          {resultsError ? (
+            <div role="alert" className="p-6 text-sm text-rose-700">Could not load these leads. <button className="underline" onClick={() => void reloadResults()}>Retry</button></div>
+          ) : statusLoading || isLoading ? (
             <div className="p-6"><TableSkeleton /></div>
           ) : isRunning ? (
             <EmptyState
@@ -321,7 +337,7 @@ function JobDetailContent({ jobId }: { jobId: string }) {
             <EmptyState
               icon={<Building2 className="h-10 w-10" />}
               title="No results yet"
-              subtitle="This job has no qualified leads"
+              subtitle="No saved lead records match the current filters"
             />
           ) : filtered.length === 0 ? (
             <EmptyState
@@ -336,12 +352,12 @@ function JobDetailContent({ jobId }: { jobId: string }) {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-slate-100 bg-slate-50/50">
+                      <Th>Row</Th>
                       <Th onClick={() => toggleSort('company_name')}><span className="flex items-center gap-1">Company {sortIcon('company_name')}</span></Th>
                       <Th onClick={() => toggleSort('contact_name')}><span className="flex items-center gap-1">Contact {sortIcon('contact_name')}</span></Th>
                       <Th>Email</Th>
                       <Th onClick={() => toggleSort('final_score')}><span className="flex items-center gap-1">Score {sortIcon('final_score')}</span></Th>
                       <Th onClick={() => toggleSort('priority')}><span className="flex items-center gap-1">Priority {sortIcon('priority')}</span></Th>
-                      <Th>Validation</Th>
                       <Th>Reviewed</Th>
                       <Th>Owner / follow-up</Th>
                       <Th>Evidence</Th>
@@ -355,14 +371,12 @@ function JobDetailContent({ jobId }: { jobId: string }) {
                         onClick={() => openLead(lead)}
                         className="hover:bg-brand-50/40 transition-colors cursor-pointer"
                       >
+                        <td className="px-4 py-3 text-xs text-slate-500" title="Stored data row; use this number in chat">{lead.row_number ?? '—'}</td>
                         <td className="px-6 py-3 font-medium text-slate-800 max-w-[200px] truncate">{dash(lead.company_name)}</td>
                         <td className="px-4 py-3 text-slate-600">{dash(lead.contact_name)}</td>
                         <td className="px-4 py-3 text-slate-600 max-w-[180px] truncate">{lead.email_address ?? '—'}</td>
                         <td className="px-4 py-3"><ScoreChip score={lead.final_score} /></td>
                         <td className="px-4 py-3"><PriorityBadge priority={lead.priority} /></td>
-                        <td className="px-4 py-3">
-                          {lead.validation_status ? <Badge color={lead.validation_status === 'Passed' ? 'success' : 'warning'}>{lead.validation_status}</Badge> : <span className="text-slate-400">—</span>}
-                        </td>
                         <td className="px-4 py-3"><LeadTracking lead={lead} jobId={jobId} onSaved={trackingSaved} /></td>
                         <td className="px-4 py-3"><div className="space-y-1"><OwnerBadge lead={lead} /><div><FollowUpBadge lead={lead} /></div></div></td>
                         <td className="px-4 py-3"><EvidenceBadge lead={lead} /></td>
@@ -444,7 +458,7 @@ function JobDetailContent({ jobId }: { jobId: string }) {
       {/* Lead drawer */}
       {drawerOpen && (
         <Suspense fallback={null}>
-          <LeadDetailDrawer jobId={jobId} onSaved={trackingSaved} lead={selectedLead} open={drawerOpen} onClose={() => { opening.current += 1; setDrawerOpen(false); }} />
+          <LeadDetailDrawer jobId={jobId} onSaved={trackingSaved} lead={selectedLead} open={drawerOpen} onClose={() => { opening.current += 1; detailRequest.current?.abort(); setDrawerOpen(false); }} />
         </Suspense>
       )}
 

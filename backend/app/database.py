@@ -88,9 +88,7 @@ def db_session() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
-        logger.info("db_session: committing...")   # ← ADD
         db.commit()
-        logger.info("db_session: committed OK")    # ← ADD
     except Retry:
         db.rollback()
         raise
@@ -105,57 +103,35 @@ def db_session() -> Generator[Session, None, None]:
 # ── Health check ──────────────────────────────────────────────────────────────
 @contextmanager
 def locked_chat_session(conversation_id: str):
-    """Serialize each conversation across API workers without long transactions.
+    """Serialize a conversation while allowing commits to return SQL connections.
 
-    The connection remains dedicated until the session lock is released. Reads
-    can commit before AI waits while the lock prevents interleaved chat turns.
+    Long model/vector waits hold only a renewable Redis lease. Every SQL commit
+    checks ownership; chat routes also take a short transaction lock when saving
+    ordered turns. A failed lease cannot authorize a stale writer.
     """
-    with engine.connect() as connection:
-        db = Session(bind=connection, expire_on_commit=False)
-        acquired = False
-        resource = "ql:chat:" + conversation_id
-        try:
-            if connection.dialect.name == "mssql":
-                result = connection.execute(text("""
-                    SET NOCOUNT ON;
-                    DECLARE @result int;
-                    EXEC @result = sp_getapplock @Resource=:resource,
-                        @LockMode='Exclusive', @LockOwner='Session', @LockTimeout=2000;
-                    SELECT @result;
-                """), {"resource": resource}).scalar()
-                if result is None or result < 0:
-                    connection.rollback()
-                    raise TimeoutError("A reply is already being prepared for this conversation")
-                acquired = True
-                connection.commit()
-            yield db
-            db.commit()
-        except Exception:
+    from app.utils.chat_lease import ConversationLease
+    lease = ConversationLease(conversation_id)
+    db = None
+    try:
+        lease.acquire()
+        db = SessionLocal()
+        event.listen(db, "before_commit", lease.assert_owned)
+        yield db
+        db.commit()
+    except Exception:
+        if db is not None:
             db.rollback()
-            raise
+        raise
+    finally:
+        try:
+            if db is not None:
+                db.close()
         finally:
-            db.close()
-            if acquired:
-                try:
-                    result = connection.execute(text("""
-                        SET NOCOUNT ON;
-                        DECLARE @result int;
-                        EXEC @result = sp_releaseapplock @Resource=:resource, @LockOwner='Session';
-                        SELECT @result;
-                    """), {"resource": resource}).scalar()
-                    connection.commit()
-                    if result is None or result < 0:
-                        connection.invalidate()
-                except Exception:
-                    connection.invalidate()
-            elif connection.dialect.name == "mssql":
-                # Lock acquisition could fail after the server acquired it but
-                # before the client received its result. Do not pool that socket.
-                connection.invalidate()
+            lease.release()
 
 
 @contextmanager
-def locked_lead_session(lead_id: str):
+def locked_lead_session(lead_id: str, *, lock_timeout_ms: int = 30000, artifact_shared: bool = False):
     """A SQL session lock survives stage commits and serializes matching leads.
 
     SQL Server releases it on disconnect, including worker crashes. No Redis
@@ -164,38 +140,120 @@ def locked_lead_session(lead_id: str):
     with engine.connect() as connection:
         db = Session(bind=connection, expire_on_commit=False)
         resource = None
+        acquired = False
+        attempted = False
+        acquisition_known = False
+        artifact_resource = None
+        artifact_acquired = artifact_attempted = artifact_known = False
         try:
             from app.models import Lead
-            lead = db.get(Lead, lead_id)
+            lead = db.query(Lead.id, Lead.tracking_id, Lead.job_id).filter(Lead.id == lead_id).first()
             resource = "ql:process:" + str(lead.tracking_id or lead.id) if lead else None
+            artifact_resource = "ql:artifacts:" + str(lead.job_id) if lead and artifact_shared else None
             db.rollback()
             if resource and connection.dialect.name == "mssql":
+                attempted = True
                 result = connection.execute(text("""
                     SET NOCOUNT ON;
                     DECLARE @result int;
                     EXEC @result = sp_getapplock @Resource=:resource,
-                         @LockMode='Exclusive', @LockOwner='Session', @LockTimeout=30000;
+                         @LockMode='Exclusive', @LockOwner='Session', @LockTimeout=:timeout_ms;
                     SELECT @result;
-                """), {"resource": resource}).scalar()
+                """), {"resource": resource, "timeout_ms": max(0, min(int(lock_timeout_ms), 30000))}).scalar()
+                acquisition_known = result is not None
+                acquired = result is not None and result >= 0
                 connection.commit()
-                if result is None or result < 0:
-                    resource = None
+                if not acquired:
                     raise TimeoutError("Lead is being processed by another worker")
+            if artifact_resource and connection.dialect.name == "mssql":
+                artifact_attempted = True
+                code = connection.execute(text("""
+                    SET NOCOUNT ON;
+                    DECLARE @result int;
+                    EXEC @result = sp_getapplock @Resource=:resource,
+                        @LockMode='Shared', @LockOwner='Session', @LockTimeout=:timeout_ms;
+                    SELECT @result;
+                """), {"resource": artifact_resource,
+                         "timeout_ms": max(0, min(int(lock_timeout_ms), 1000))}).scalar()
+                artifact_known = code is not None
+                artifact_acquired = code is not None and code >= 0
+                connection.commit()
+                if not artifact_acquired:
+                    raise TimeoutError("This upload is being deleted")
             yield db
             db.commit()
         except Exception:
             db.rollback()
             raise
         finally:
-            db.close()
-            if resource and connection.dialect.name == "mssql":
-                try:
-                    connection.execute(text(
-                        "EXEC sp_releaseapplock @Resource=:resource, @LockOwner='Session'"
-                    ), {"resource": resource})
-                    connection.commit()
-                except Exception:
-                    connection.invalidate()  # Never return a locked connection to the pool.
+            try:
+                db.close()
+            finally:
+                resources = ([artifact_resource] if artifact_acquired else []) + ([resource] if acquired else [])
+                _release_session_resources(connection, resources,
+                    uncertain=(attempted and not acquisition_known) or (artifact_attempted and not artifact_known))
+
+
+@contextmanager
+def locked_import_session(job_id: str):
+    """Serialize paid parsing/mapping across import retries and recovery tasks."""
+    with engine.connect() as connection:
+        db = Session(bind=connection, expire_on_commit=False)
+        acquired = False
+        attempted = connection.dialect.name == "mssql"
+        acquisition_known = False
+        resource = "ql:import:" + job_id
+        try:
+            if attempted:
+                code = connection.execute(text("""
+                    SET NOCOUNT ON;
+                    DECLARE @result int;
+                    EXEC @result = sp_getapplock @Resource=:resource,
+                        @LockMode='Exclusive', @LockOwner='Session', @LockTimeout=1000;
+                    SELECT @result;
+                """), {"resource": resource}).scalar()
+                acquisition_known = code is not None
+                acquired = code is not None and code >= 0
+                connection.commit()
+                if not acquired:
+                    raise TimeoutError("This upload is already importing")
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            try:
+                db.close()
+            finally:
+                _release_session_resources(connection, [resource] if acquired else [],
+                    uncertain=attempted and not acquisition_known)
+
+
+def _release_session_resources(connection, resources, *, uncertain=False):
+    """Never pool a socket with unconfirmed SQL session locks, even on close errors."""
+    if connection.dialect.name != "mssql":
+        return
+    try:
+        if uncertain:
+            connection.invalidate()
+            return
+        for resource in resources:
+            code = connection.execute(text("""
+                SET NOCOUNT ON;
+                DECLARE @result int;
+                EXEC @result = sp_releaseapplock @Resource=:resource, @LockOwner='Session';
+                SELECT @result;
+            """), {"resource": resource}).scalar()
+            connection.commit()
+            if code is None or code < 0:
+                connection.invalidate()
+                return
+    except Exception:
+        try:
+            connection.invalidate()
+        except Exception:
+            logger.warning("Could not explicitly invalidate a failed SQL session-lock connection")
 
 
 def ping_db() -> bool:
@@ -218,6 +276,8 @@ def schema_ready() -> bool:
                     l.person_company_key, l.input_fingerprint, l.research_fingerprint,
                     l.reused_from_lead_id, l.reuse_kind, t.reviewed, t.notes, t.version,
                     j.reused_rows, j.research_reused_rows, l.evidence_checked_at,
+                    j.source_blob_name, j.upload_fingerprint, j.dispatch_row_index, j.dispatch_lead_id,
+                    j.dispatch_complete, j.dispatch_updated_at, j.dispatch_epoch,
                     t.owner_id, t.follow_up_at, t.follow_up_note, t.follow_up_completed_at
                 FROM leads l JOIN lead_tracking t ON t.id=l.tracking_id
                 JOIN jobs j ON j.id=l.job_id
@@ -235,6 +295,16 @@ def schema_ready() -> bool:
                     finished_at, error_message, attempt_count, last_dispatched_at,
                     previous_snapshot_json FROM lead_refresh
             """))
+            conn.execute(text("SELECT TOP 0 scoring_version, qualification_status, scoring_details_json, scoring_audit_json FROM final_scores"))
+            conn.execute(text("""
+                SELECT TOP 0 ingest_status, ingest_attempts, ingest_dispatched_at, ingest_error
+                FROM company_scrape
+            """))
+            if conn.execute(text("""
+                SELECT TOP 1 id FROM final_scores
+                WHERE scoring_version IS NULL OR scoring_version <> 'icp_contact_growth_v2'
+            """)).first():
+                return False
             if conn.execute(text("""
                 SELECT COUNT(*) FROM sys.indexes
                 WHERE object_id=OBJECT_ID('lead_refresh') AND is_unique=1 AND has_filter=1
@@ -261,5 +331,5 @@ def schema_ready() -> bool:
                 return False
         return True
     except Exception:
-        logger.warning("Schema is not ready; apply the lead reuse, chat reliability and team workflow migrations")
+        logger.warning("Schema is not ready; apply the lead reuse, chat reliability, team workflow and scoring v2 migrations")
         return False

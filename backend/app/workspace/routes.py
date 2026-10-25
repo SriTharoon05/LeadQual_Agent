@@ -12,10 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import and_, case, delete, func, or_, update
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, joinedload, selectinload, load_only, noload
 
 from app.database import get_db
-from app.lead_results import LeadResultResponse, lead_to_response
+from app.lead_results import LeadResultResponse, latest_refreshes, lead_to_response
 from app.models import FinalScore, Job, Lead, LeadTracking, SavedSegment, TeamMember
 from app.utils.lead_identity import transaction_lock
 from app.workspace.filters import (
@@ -383,8 +383,8 @@ def _representative_query(db: Session, filters: LeadFilters, now: datetime):
     return filtered_query(db, filters, now, base=base)
 
 
-def _lead_item(lead: Lead) -> WorkspaceLeadResponse:
-    value = lead_to_response(lead).model_dump()
+def _lead_item(lead: Lead, details=True, latest=None) -> WorkspaceLeadResponse:
+    value = lead_to_response(lead, include_details=details, latest_refresh=latest).model_dump()
     value.update(
         job_id=str(lead.job_id), file_name=lead.job.file_name if lead.job else None,
         row_number=lead.row_index + 1 if lead.row_index is not None else None,
@@ -392,12 +392,22 @@ def _lead_item(lead: Lead) -> WorkspaceLeadResponse:
     return WorkspaceLeadResponse(**value)
 
 
-def _page(query, total: int, limit: int, offset: int, ordering) -> WorkspacePage:
+def _page(query, total: int, limit: int, offset: int, ordering, *, details=True) -> WorkspacePage:
+    score_loader = joinedload(Lead.final_score)
+    if not details:
+        score_loader = score_loader.load_only(FinalScore.total_score, FinalScore.icp_score,
+            FinalScore.growth_score, FinalScore.contact_score, FinalScore.priority,
+            FinalScore.qualification_status, FinalScore.scoring_version)
+    summary_load = [] if details else [load_only(Lead.id, Lead.job_id, Lead.row_index,
+        Lead.contact_name, Lead.company_name, Lead.job_title, Lead.email_address,
+        Lead.reuse_kind, Lead.reused_from_lead_id, Lead.evidence_checked_at, Lead.tracking_id)]
     leads = query.options(
-        joinedload(Lead.job), joinedload(Lead.final_score),
-        selectinload(Lead.validation_results), selectinload(Lead.refresh_requests),
+        joinedload(Lead.job).load_only(Job.file_name, Job.icp_prompt), score_loader,
+        selectinload(Lead.validation_results) if details else noload(Lead.validation_results),
+        noload(Lead.refresh_requests), *summary_load,
     ).order_by(*ordering, Lead.id.asc()).offset(offset).limit(limit).all()
-    items = [_lead_item(lead) for lead in leads]
+    latest = latest_refreshes(query.session, [lead.id for lead in leads])
+    items = [_lead_item(lead, details, latest.get(str(lead.id))) for lead in leads]
     return WorkspacePage(
         items=items, total=total, limit=limit, offset=offset, returned=len(items),
         has_more=offset + len(items) < total,
@@ -407,11 +417,12 @@ def _page(query, total: int, limit: int, offset: int, ordering) -> WorkspacePage
 @router.get("/leads", response_model=WorkspacePage)
 def workspace_leads(
     request: Request,
+    details: bool = Query(True),
     filters: LeadFilters = Depends(lead_filter_params),
     segment_id: Optional[UUID] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    sort_by: Literal["recent", "company_name", "contact_name", "final_score", "follow_up_at", "evidence_checked_at"] = Query("recent"),
+    sort_by: Literal["recent", "company_name", "contact_name", "final_score", "follow_up_at", "evidence_checked_at"] = Query("final_score"),
     sort_dir: Literal["asc", "desc"] = Query("desc"),
     db: Session = Depends(get_db),
 ):
@@ -428,11 +439,12 @@ def workspace_leads(
         }
         column = columns[sort_by]
         order = column.asc() if sort_dir == "asc" else column.desc()
-        return _page(query, total, limit, offset, (case((column.is_(None), 1), else_=0).asc(), order))
+        return _page(query, total, limit, offset, (case((column.is_(None), 1), else_=0).asc(), order), details=details)
 
 
 @router.get("/reminders", response_model=ReminderPage)
 def workspace_reminders(
+    details: bool = Query(True),
     status_filter: Literal["all", "due", "upcoming", "completed"] = Query("due", alias="status"),
     owner_id: Optional[UUID] = Query(None),
     limit: int = Query(50, ge=1, le=200),
@@ -460,7 +472,7 @@ def workspace_reminders(
                 case((LeadTracking.follow_up_completed_at.isnot(None), 1), else_=0).asc(),
                 LeadTracking.follow_up_at.asc(),
             )
-        page = _page(query, total, limit, offset, ordering)
+        page = _page(query, total, limit, offset, ordering, details=details)
         return ReminderPage(
             **page.model_dump(), due_count=counts["due"],
             upcoming_count=counts["upcoming"], completed_count=counts["completed"],

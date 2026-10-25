@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
+const BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/$/, '');
 
 export const apiClient = axios.create({
   baseURL: BASE_URL,
@@ -22,7 +22,14 @@ let isRedirecting = false;
 apiClient.interceptors.response.use(
   (res) => res,
   (err) => {
-    if (err.response?.status === 401 && !isRedirecting) {
+    // A rejected password is a normal login error. Redirecting here used to
+    // reload the form, erase its error and make sign-in failures look random.
+    const isLogin = /(?:^|\/)auth\/login(?:\?|$)/.test(err.config?.url ?? '');
+    const sentAuthorization = err.config?.headers?.Authorization;
+    const currentToken = localStorage.getItem('token');
+    const belongsToCurrentSession = typeof sentAuthorization === 'string'
+      && currentToken !== null && sentAuthorization === `Bearer ${currentToken}`;
+    if (err.response?.status === 401 && !isLogin && belongsToCurrentSession && !isRedirecting) {
       isRedirecting = true;
       localStorage.removeItem('token');
       localStorage.removeItem('username');

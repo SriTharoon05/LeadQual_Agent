@@ -7,6 +7,7 @@ migrate them to bcrypt without locking themselves out.
 
 from datetime import datetime, timedelta, timezone
 import logging
+import re
 
 import bcrypt
 import jwt
@@ -59,6 +60,12 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path.rstrip("/") or "/"
         if request.method == "OPTIONS" or path in PUBLIC_PATHS:
+            return await call_next(request)
+
+        # A short-lived, file-scoped ticket is verified by this route. Never
+        # accept it for API/status calls or as a general authentication token.
+        if (request.method == "GET" and request.query_params.get("ticket")
+                and re.fullmatch(r"/jobs/[0-9a-fA-F-]{36}/exports/[0-9a-fA-F-]{36}/file", path)):
             return await call_next(request)
 
         value = request.headers.get("Authorization", "")

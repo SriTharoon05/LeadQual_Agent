@@ -28,6 +28,7 @@ def _new_uuid() -> str:
 # ── jobs ──────────────────────────────────────────────────────────────────────
 class Job(Base):
     __tablename__ = "jobs"
+    __table_args__ = (Index("ix_jobs_dispatch_recovery", "status", "dispatch_complete", "dispatch_updated_at"),)
 
     id: Mapped[str] = mapped_column(
         UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
@@ -46,6 +47,13 @@ class Job(Base):
     file_type: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     duplicates_removed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     import_error:       Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    source_blob_name: Mapped[Optional[str]] = mapped_column(Unicode(1000), nullable=True)
+    upload_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    dispatch_row_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    dispatch_lead_id: Mapped[Optional[str]] = mapped_column(UNIQUEIDENTIFIER, nullable=True)
+    dispatch_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("0"))
+    dispatch_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    dispatch_epoch: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     # xlsx | csv
 
     created_at: Mapped[datetime] = mapped_column(
@@ -321,6 +329,10 @@ class FinalScore(Base):
     data_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     growth_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     contact_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    scoring_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    qualification_status: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    scoring_details_json: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
+    scoring_audit_json: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True, deferred=True)
 
     priority: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     # High | Medium | Low
@@ -344,6 +356,10 @@ class FinalScore(Base):
 # ── company_scrape (RAG ingestion) ────────────────────────────────────────────
 class CompanyScrape(Base):
     __tablename__ = "company_scrape"
+    __table_args__ = (
+        Index("ix_scrape_latest", "lead_id", "scraped_at", "id"),
+        Index("ix_scrape_ingestion", "ingest_status", "ingest_dispatched_at"),
+    )
 
     id: Mapped[str] = mapped_column(
         UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
@@ -357,10 +373,14 @@ class CompanyScrape(Base):
 
     company_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     website_url:  Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    clean_text:   Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    clean_text:   Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
     blob_path:    Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     chunk_count:  Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     embedded:     Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 0=pending 1=done
+    ingest_status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued", server_default=text("'queued'"))
+    ingest_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ingest_dispatched_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    ingest_error: Mapped[Optional[str]] = mapped_column(Unicode(1000), nullable=True)
 
     scraped_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.getutcdate()

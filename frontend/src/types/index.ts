@@ -44,6 +44,7 @@ export interface JobStatusResponse {
   progress_pct:       number;           // ← remove null, backend always returns float
   duplicates_removed?: number | null;
   import_error?:       string | null;
+  upload_pending?:     boolean;
   created_at:         string | null;
   completed_at:       string | null;
   llm_model?:         string | null;    // ← ADD
@@ -95,6 +96,7 @@ export interface LeadResult {
   evidence_checked_at: string | null;
   employment_status: 'current' | 'former' | 'unclear';
   lead_id: string;
+  row_number: number | null;
   contact_name: string | null;
   company_name: string | null;
   job_title: string | null;
@@ -105,11 +107,11 @@ export interface LeadResult {
   growth_signals: string | null;
   outreach_intelligence: string | null;
   icp_score: number | null;
-  authority_score: number | null;
-  data_score: number | null;
   growth_score: number | null;
   contact_score: number | null;
-  validation_status: string | null;
+  qualification_status: 'qualified' | 'needs_review' | 'disqualified' | 'uncontactable' | null;
+  scoring_version: string | null;
+  scoring_details: { reasons?: string[]; raw_weighted_score?: number; weights?: { icp: number; contact: number; growth: number } };
   source_urls: string[];
   company_description: string | null;
   technologies_used: string | null;
@@ -190,6 +192,13 @@ export interface TrackingUpdate {
 }
 
 export interface IcpProof {
+  required?: boolean;
+  methods?: {
+    kind: string; value: string; status: string; delivery_status: string;
+    checked_at: string | null; explanation: string;
+    observations: { type: string; domain?: string; records?: string[]; response?: string; code?: number; e164?: string; format_valid?: boolean; possible?: boolean }[];
+    sources: { url: string; title: string; excerpt: string }[];
+  }[];
   field: string;
   label: string;
   value: string;

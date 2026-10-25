@@ -22,8 +22,9 @@ Single entry point the pipeline should call:
 import logging
 import re
 
-import requests
 from bs4 import BeautifulSoup
+from app.config import settings
+from app.utils.public_web import fetch_public_html
 
 logger = logging.getLogger(__name__)
 
@@ -60,25 +61,18 @@ def scrape_website(url: str) -> dict:
         return {"text": "", "reachable": False, "source": "scrape", "source_url": ""}
 
     try:
-        response = requests.get(
-            normalized,
-            headers={"User-Agent": USER_AGENT},
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        logger.info("scrape_website: %s unreachable (%s)", normalized, exc)
+        body, final_url = fetch_public_html(normalized, USER_AGENT,
+            settings.SCRAPE_MAX_HTML_BYTES, timeout=REQUEST_TIMEOUT)
+    except Exception as exc:
+        logger.info("Company website could not be read (%s)", type(exc).__name__)
         return {"text": "", "reachable": False, "source": "scrape",
                 "source_url": normalized}
 
-    final_url = response.url or normalized
-
     # Prefer lxml; fall back to the stdlib parser if lxml isn't installed.
     try:
-        soup = BeautifulSoup(response.text, "lxml")
+        soup = BeautifulSoup(body, "lxml")
     except Exception:
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(body, "html.parser")
 
     for tag in soup(["script", "style", "nav", "footer", "noscript"]):
         tag.decompose()
@@ -86,8 +80,9 @@ def scrape_website(url: str) -> dict:
     text = soup.get_text(separator=" ", strip=True)
     text = re.sub(r"\s+", " ", text).strip()
 
-    return {"text": text, "reachable": True, "source": "scrape",
-            "source_url": final_url}
+    truncated = len(text) > settings.SCRAPE_MAX_TEXT_CHARS
+    return {"text": text[:settings.SCRAPE_MAX_TEXT_CHARS], "reachable": True, "source": "scrape",
+            "source_url": final_url, "truncated": truncated}
 
 
 # ── Orchestrator (single entry point) ─────────────────────────────────────────
@@ -110,6 +105,7 @@ def research_company(company_name: str, website_url: str) -> dict:
             "source":     "scrape",
             "source_url": scrape_result["source_url"],
             "reachable":  True,
+            "truncated": bool(scrape_result.get("truncated")),
         }
 
     # Reachable but thin, or unreachable — return whatever text we managed to get.

@@ -1,4 +1,5 @@
 import { Globe2, ShieldCheck } from 'lucide-react';
+import { useState } from 'react';
 import { fmtDate } from '@/lib/format';
 import type { LeadResult } from '@/types';
 
@@ -28,6 +29,15 @@ const verdicts = {
   not_specified: ['Not requested', 'bg-slate-100 text-slate-600 ring-slate-200'],
 };
 
+function ProofSources({ sources }: { sources: { url: string; title: string; excerpt: string }[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const unique = [...new Map(sources.map((source) => [source.url, source] as const)).values()];
+  return <span className="inline-flex flex-wrap items-center gap-1.5">
+    {(expanded ? unique : unique.slice(0, 2)).map((source) => <SourceGlobe key={source.url} {...source} />)}
+    {unique.length > 2 && <button type="button" onClick={() => setExpanded((value) => !value)} className="text-xs text-sky-700 underline">{expanded ? 'See less' : `See ${unique.length - 2} more sources`}</button>}
+  </span>;
+}
+
 export function IcpEvidence({ lead }: { lead: LeadResult }) {
   return <div className="space-y-4">
     <div className="rounded-lg border border-brand-100 bg-white p-3">
@@ -36,10 +46,11 @@ export function IcpEvidence({ lead }: { lead: LeadResult }) {
     </div>
     <div>
       <h5 className="flex items-center gap-2 font-semibold text-slate-800"><ShieldCheck className="h-4 w-4 text-brand-500" />ICP validation proofs</h5>
-      <p className="mt-1 text-xs text-slate-500">AI ICP check against researched facts. Open a globe to inspect the supporting source.</p>
+      <p className="mt-1 text-xs text-slate-500">ICP fit, contact availability, and growth evidence. Open a globe to inspect a source. Contact checks establish availability, not guaranteed delivery.</p>
       {lead.evidence_checked_at && <p className="mt-1 text-xs text-slate-500">Evidence checked: {fmtDate(lead.evidence_checked_at)}{lead.reuse_kind ? ' · Reused evidence retains its original date' : ''}</p>}
     </div>
-    {!lead.icp_proofs?.length ? <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900">Evidence unavailable for this earlier result. Its saved summary is shown below.</p> :
+    {!lead.icp_proofs?.some((proof) => ['employee_count', 'location', 'annual_revenue', 'industry', 'seniority', 'employment'].includes(proof.field)) && <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900">This earlier result has no complete company/contact ICP proofs. Refresh its evidence before treating the ICP as confirmed.</p>}
+    {!lead.icp_proofs?.length ? null :
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         {lead.icp_proofs.map((proof) => {
           const [label, color] = verdicts[proof.verdict] || verdicts.unclear;
@@ -53,13 +64,22 @@ export function IcpEvidence({ lead }: { lead: LeadResult }) {
             </div>
             <p className="mt-3 text-xs text-slate-500">ICP requirement</p>
             <p className="mt-0.5 text-sm text-slate-600">{proof.requirement}</p>
-            <p className="mt-3 text-xs font-medium text-slate-500">AI ICP check</p>
+            <p className="mt-3 text-xs font-medium text-slate-500">{proof.field === 'contact_method' ? 'Recorded contact check' : proof.field === 'growth' ? 'Sourced growth check' : 'AI ICP check'}</p>
             <div className="mt-1 flex flex-wrap items-center gap-2">
               <p className="text-sm font-semibold text-slate-800">{finding}</p>
-              {proof.sources.map((source, i) => <SourceGlobe key={`${source.url}-${i}`} {...source} />)}
+              <ProofSources sources={proof.sources} />
             </div>
             {proof.status === 'conflicting' && <p className="mt-1 text-xs font-medium text-amber-700">Sources disagree</p>}
             {proof.explanation && <p className="mt-2 text-xs leading-relaxed text-slate-500">{proof.explanation}</p>}
+            {proof.required === false && proof.field !== 'growth' && proof.verdict !== 'not_specified' && <p className="mt-1 text-xs text-slate-500">Preference · does not disqualify a lead</p>}
+            {proof.methods?.map((method, index) => <div key={`${method.kind}-${method.value}-${index}`} className="mt-3 rounded-lg border border-slate-100 bg-slate-50 p-3 text-xs">
+              <p className="break-all font-semibold text-slate-700">{method.kind === 'email' ? 'Email' : 'Phone'} · {method.value}</p>
+              <p className="mt-1 leading-relaxed text-slate-600">{method.explanation}</p>
+              <p className="mt-1 text-slate-500">{method.kind === 'email' ? 'Inbox delivery' : 'Call reachability'}: unknown{method.checked_at ? ` · Checked ${fmtDate(method.checked_at)}` : ' · Original check details unavailable'}</p>
+              {!!method.observations?.length && <details className="mt-2 text-slate-600"><summary className="cursor-pointer font-medium">Inspect recorded check</summary><ul className="mt-2 space-y-1 break-words">{method.observations.map((observation, item) => <li key={item}>
+                <span className="font-medium">{observation.type}</span>{observation.domain ? ` · ${observation.domain}` : ''}{observation.e164 ? ` · ${observation.e164}` : ''}{observation.records?.length ? ` · ${observation.records.join('; ')}` : ''}{observation.code ? ` · response ${observation.code}` : ''}{observation.response ? ` · ${observation.response}` : ''}{observation.format_valid != null ? ` · format ${observation.format_valid ? 'valid' : 'not confirmed'}` : ''}
+              </li>)}</ul><p className="mt-2 text-[11px]">DNS links show live records; these observations preserve what this check returned.</p></details>}
+            </div>)}
             {proof.reasoning && <p className="mt-2 text-xs leading-relaxed text-slate-600">{proof.reasoning}</p>}
           </article>;
         })}

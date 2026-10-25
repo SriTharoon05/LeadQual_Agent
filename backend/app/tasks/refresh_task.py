@@ -11,6 +11,7 @@ from celery.signals import worker_ready, worker_shutdown
 from sqlalchemy import and_, case, or_
 
 from app.celery_app import celery
+from app.config import CELERY_QUEUE_NAME
 from app.database import db_session, locked_lead_session
 from app.models import CompanyScrape, FinalScore, Lead, LeadRefresh, ValidationResult
 from app.scoring.scoring_engine import score_lead
@@ -46,7 +47,7 @@ def _require_result(result, stage: str) -> None:
     if stage == "ICP validation" and not data.get("checks"):
         raise RefreshStageError("ICP validation did not return structured checks")
     if stage == "Scoring":
-        for field in ("icp_score", "authority_score", "data_score", "growth_score", "contact_score"):
+        for field in ("icp_score", "growth_score", "contact_score"):
             try:
                 value = data[field]
                 if isinstance(value, bool) or not math.isfinite(float(value)) or not 0 <= float(value) <= 100:
@@ -139,22 +140,16 @@ def _refresh(db, request_id: str, lead_id: str):
         # Intentionally bypass both saved stage rows and the identity web cache.
         web = research_lead(lead_data, job_id=job_id, lead_id=lead_id)
         _require_result(web, "Web research")
-        contact = verify_contact(lead_data, web)
+        contact = verify_contact(lead_data, web, icp_prompt=icp_prompt)
         _require_result(contact, "Contact verification")
-        email_notes = str(getattr(contact, "email_notes", ""))
-        # The contact verifier intentionally records DNS failures as notes.
-        # NXDOMAIN/NoAnswer are negative findings; resolver/network timeouts are
-        # failed checks and must not replace a previously qualified contact.
-        dns_failure = (email_notes.startswith("No MX record for ")
-                       and email_notes.rsplit(": ", 1)[-1] not in {"NXDOMAIN", "NoAnswer"})
-        if email_notes.startswith("Email check error:") or dns_failure:
-            raise RefreshStageError("Contact verification could not finish")
+        # Inconclusive contact checks retain explicit unknown statuses. They
+        # must not become hidden disqualifiers or a claim of non-deliverability.
         icp = validate_icp(lead_data, icp_prompt, job_id=job_id, lead_id=lead_id,
                            evidence=web.evidence, contact_result=contact)
         _require_result(icp, "ICP validation")
         lead_data["Company Description"] = web.company_description or ""
         lead_data["Technologies Used"] = web.technologies_used or ""
-        score = score_lead(lead_data, icp, web, contact, job_id=job_id, lead_id=lead_id)
+        score = score_lead(lead_data, icp, web, contact, job_id=job_id, lead_id=lead_id, icp_prompt=icp_prompt)
         _require_result(score, "Scoring")
 
         # Refresh loaded objects after the external waits; deletion or other
@@ -167,16 +162,19 @@ def _refresh(db, request_id: str, lead_id: str):
                          bool(web.company_verified), sources=web.sources)
         _save_validation(db, lead_id, "contact", contact,
                          _num(contact.contact_quality_score),
-                         bool(contact.email_valid or contact.phone_valid))
+                         contact.contact_available)
         _save_validation(db, lead_id, "icp", icp, _num(icp.icp_score), bool(icp.icp_match))
         # Preserve score identity so consumers always see one current score.
         final = lead.final_score
         if final is None:
             final = FinalScore(lead_id=lead_id)
             db.add(final)
-        for field in ("total_score", "icp_score", "authority_score", "data_score",
-                      "growth_score", "contact_score"):
+        for field in ("total_score", "icp_score", "growth_score", "contact_score"):
             setattr(final, field, _num(getattr(score, field, 0)))
+        final.authority_score = final.data_score = None
+        final.scoring_version = score.scoring_version
+        final.qualification_status = score.qualification_status
+        final.scoring_details_json = score.scoring_details_json
         for field in ("priority", "reasoning", "growth_signals", "outreach_intelligence"):
             setattr(final, field, getattr(score, field, "") or "")
         final.created_at = _now()
@@ -194,8 +192,6 @@ def _refresh(db, request_id: str, lead_id: str):
         # Older scrape prose can contradict refreshed employment/company facts.
         # Proof-backed fresh descriptions replace it in the chatbot; embedding
         # availability is deliberately outside the refresh's critical path.
-        db.query(CompanyScrape).filter(CompanyScrape.lead_id == lead_id).delete(
-            synchronize_session=False)
         run.status = "completed"
         run.finished_at = _now()
         run.error_message = None
@@ -205,6 +201,10 @@ def _refresh(db, request_id: str, lead_id: str):
         identity = lead.research_fingerprint or lead.id
         cache_key = "ql:web:v2:" + hashlib.sha256(str(identity).encode("utf-8")).hexdigest()
         _set_cached_web(cache_key, web)
+        # Refresh the website/index asynchronously. Keep the prior successful
+        # prose and its original observation date until new ingestion succeeds.
+        from app.tasks.embed_task import persist_and_dispatch_embed
+        persist_and_dispatch_embed(db, lead, web, force=True)
         return
     except Exception:
         db.rollback()
@@ -223,7 +223,7 @@ def _refresh(db, request_id: str, lead_id: str):
 
 
 @worker_ready.connect
-def recover_refresh_requests(**_kwargs):
+def recover_refresh_requests(sender=None, **_kwargs):
     """Periodically reconcile durable requests without requiring Celery Beat.
 
     Work happens outside the worker-ready signal thread. Rotating bounded scans
@@ -231,6 +231,9 @@ def recover_refresh_requests(**_kwargs):
     Each publish is still protected by its SQL dispatch lock.
     """
     global _recovery_thread
+    queues = getattr(getattr(sender, "task_consumer", None), "queues", ())
+    if CELERY_QUEUE_NAME not in {queue.name for queue in queues}:
+        return
     if _recovery_thread is not None and _recovery_thread.is_alive():
         return
     _recovery_stop.clear()

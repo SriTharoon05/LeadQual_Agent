@@ -8,13 +8,14 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.chat.router import answer as run_chat
 from app.database import get_db, locked_chat_session
 from app.models import ChatConversation, ChatMessage, Job
-from app.utils.lead_identity import json_object
-from app.validators.evidence import safe_url
+from app.utils.lead_identity import json_object, transaction_lock
+from app.validators.evidence import citation_key, safe_url
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
@@ -86,9 +87,9 @@ def _sources(values) -> list[dict]:
         if not isinstance(source, dict):
             continue
         url = safe_url(source.get("website_url") or source.get("url"))
-        if not url or url in seen:
+        if not url or citation_key(url) in seen:
             continue
-        seen.add(url)
+        seen.add(citation_key(url))
         result.append({"company_name": str(source.get("company_name") or "Source")[:255],
                        "website_url": url, "title": str(source.get("title") or "")[:160],
                        "excerpt": str(source.get("excerpt") or "")[:500]})
@@ -147,7 +148,25 @@ def _complete_turn(db: Session, job_id: str, conversation_id: str, body: ChatReq
     if not isinstance(result, dict) or not isinstance(result.get("answer"), str) or not result["answer"].strip():
         raise RuntimeError("Chat returned an invalid response")
 
+    db.commit()
+    transaction_lock(db, "ql:chat-save:" + conversation_id)
+    _get_job_or_404(job_id, db)
+    # A previous connection can commit after a client timeout. Recheck under a
+    # short SQL lock before allocating sequence numbers or inserting a retry.
+    saved = (db.query(ChatMessage).filter(ChatMessage.conversation_id == conversation_id,
+        ChatMessage.request_id == request_id).order_by(ChatMessage.sequence).limit(3).all())
+    if saved:
+        saved_user = next((row for row in saved if row.role == "user"), None)
+        saved_assistant = next((row for row in saved if row.role == "assistant"), None)
+        if not saved_user or not saved_assistant:
+            raise HTTPException(503, "The saved reply is incomplete. Retry shortly.")
+        if json_object(saved_user.metadata_json).get("request_payload") != payload:
+            raise HTTPException(409, "This request ID was already used for a different question.")
+        return _response(saved_user, saved_assistant)
     db.refresh(conversation)
+    last_sequence = db.query(func.max(ChatMessage.sequence)).filter(
+        ChatMessage.conversation_id == conversation_id).scalar() or 0
+    conversation.next_sequence = max(conversation.next_sequence, last_sequence + 1)
     created_at = datetime.now(timezone.utc).replace(tzinfo=None)
     metadata = {"degraded": bool(result.get("degraded")),
                 "clarification": result.get("clarification"), "context": result.get("context") or {}}
@@ -191,7 +210,9 @@ def chat(job_id: UUID, body: ChatRequest):
 
 
 @router.get("/jobs/{job_id}/chat/history", response_model=list[PersistedMessage])
-def chat_history(job_id: UUID, conversation_id: UUID | None = Query(default=None), db: Session = Depends(get_db)):
+def chat_history(job_id: UUID, conversation_id: UUID | None = Query(default=None),
+                 before_sequence: int | None = Query(default=None, ge=1, le=2_147_483_647),
+                 limit: int = Query(default=100, ge=2, le=200), db: Session = Depends(get_db)):
     """Sequence ordering is stable even when timestamps are identical."""
     scope = str(job_id)
     try:
@@ -201,10 +222,12 @@ def chat_history(job_id: UUID, conversation_id: UUID | None = Query(default=None
             return []
         if str(conversation.job_id) != scope:
             raise HTTPException(status_code=404, detail="Conversation not found in this upload.")
-        rows = (db.query(ChatMessage).filter(ChatMessage.job_id == scope,
+        query = db.query(ChatMessage).filter(ChatMessage.job_id == scope,
                     ChatMessage.conversation_id == conversation.id)
-                .order_by(ChatMessage.sequence).all())
-        return [_message(row) for row in rows]
+        if before_sequence is not None:
+            query = query.filter(ChatMessage.sequence < before_sequence)
+        rows = query.order_by(ChatMessage.sequence.desc()).limit(limit).all()
+        return [_message(row) for row in reversed(rows)]
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Chat history unavailable for job=%s", scope)

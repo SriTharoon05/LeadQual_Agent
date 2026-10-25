@@ -14,6 +14,8 @@ import { useToast } from '@/components/ui/Toast';
 import { uploadFile, startIcp, getJobStatus } from '@/api/endpoints';
 import { ALLOWED_EXT, isValidFile, fmtBytes } from '@/lib/format';
 import type { JobStatus } from '@/types';
+import { workspaceRequestId } from '@/lib/workspace';
+import { isAxiosError } from 'axios';
 
 // 'importing' step added: parse + column-map + bulk-insert now run in a
 // background Celery task, so the UI polls import status after uploading.
@@ -28,6 +30,19 @@ const STAGES = [
   { label: 'Completed',                         threshold: 100 },
 ];
 
+function uploadRequestId(file: File): string {
+  const key = `lead-upload:request:${localStorage.getItem('username') ?? ''}`;
+  const identity = JSON.stringify([file.name, file.size, file.lastModified]);
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(key) || 'null');
+    if (saved?.identity === identity && typeof saved.id === 'string'
+        && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(saved.id)) return saved.id;
+  } catch { /* Use a fresh ID if draft metadata was unavailable/corrupt. */ }
+  const id = workspaceRequestId();
+  try { sessionStorage.setItem(key, JSON.stringify({ identity, id })); } catch { /* Ref retains retries. */ }
+  return id;
+}
+
 export function UploadPage() {
   const navigate = useNavigate();
   const { toast } = useToast();
@@ -40,6 +55,9 @@ export function UploadPage() {
   const [jobId, setJobId] = useState<string | null>(null);
   // Import counts now arrive from polling (not from the instant upload response).
   const [importStats, setImportStats] = useState<{ total_rows: number; duplicates_removed: number } | null>(null);
+  const uploadBusy = useRef(false);
+  const icpBusy = useRef(false);
+  const uploadRequest = useRef<{ file: File; id: string } | null>(null);
 
   const handleFileSelect = useCallback((f: File) => {
     if (!isValidFile(f.name)) {
@@ -57,29 +75,50 @@ export function UploadPage() {
   }, [handleFileSelect]);
 
   const handleUpload = async () => {
-    if (!file) return;
+    if (!file || uploadBusy.current) return;
+    uploadBusy.current = true;
+    const previousUpload = uploadRequest.current;
+    const requestId = previousUpload && previousUpload.file === file ? previousUpload.id : uploadRequestId(file);
+    uploadRequest.current = { file, id: requestId };
     setStep('uploading');
     try {
-      const res = await uploadFile(file);
+      const res = await uploadFile(file, requestId);
       setJobId(res.job_id);
       // Upload returns instantly with status "importing" — poll import status next.
       setStep('importing');
-    } catch {
-      toast('Upload failed. Please check the file and try again.', 'error');
+    } catch (cause) {
+      try {
+        const current = await getJobStatus(requestId);
+        if (!current.upload_pending && current.status !== 'import_failed') {
+          setJobId(current.job_id); setStep('importing');
+          toast('The upload was accepted. Its current status has been recovered.', 'info');
+          return;
+        }
+      } catch { /* The same request ID is retained for a safe upload retry. */ }
+      const detail = isAxiosError(cause) ? cause.response?.data?.detail : undefined;
+      toast(typeof detail === 'string' ? detail : 'Could not confirm the upload. Retry the same file safely; it will reuse the same upload request.', 'error');
       setStep('select');
-    }
+    } finally { uploadBusy.current = false; }
   };
 
   const handleIcp = async () => {
-    if (!icpPrompt.trim() || !jobId) return;
+    if (!icpPrompt.trim() || !jobId || icpBusy.current) return;
+    icpBusy.current = true;
     setStep('processing');
     try {
       await startIcp(jobId, icpPrompt.trim());
       toast('Processing started', 'success');
     } catch {
-      toast('Failed to start processing', 'error');
+      try {
+        const current = await getJobStatus(jobId);
+        if (['running', 'completed', 'failed'].includes(current.status)) {
+          toast('The processing request was accepted. Loading its current status.', 'info');
+          return;
+        }
+      } catch { /* Keep the imported job; the dashboard can recover its status. */ }
+      toast('Could not confirm processing. Check this upload on the dashboard before trying again.', 'error');
       setStep('icp');
-    }
+    } finally { icpBusy.current = false; }
   };
 
   return (
@@ -187,6 +226,7 @@ export function UploadPage() {
                 jobId={jobId}
                 onReady={(stats) => { setImportStats(stats); setStep('icp'); }}
                 onFailed={(msg) => { toast(msg || 'Import failed', 'error'); setStep('select'); }}
+                onAlreadyStarted={() => navigate(`/jobs/${jobId}`)}
               />
             </motion.div>
           )}
@@ -245,20 +285,21 @@ export function UploadPage() {
 }
 
 // ── Importing view: polls job status until the background import finishes ─────
-function ImportingView({ jobId, onReady, onFailed }: {
+function ImportingView({ jobId, onReady, onFailed, onAlreadyStarted }: {
   jobId: string;
   onReady: (stats: { total_rows: number; duplicates_removed: number }) => void;
   onFailed: (msg: string) => void;
+  onAlreadyStarted: () => void;
 }) {
   const notified = useRef(false);   // fire the callback only once
 
-  const { data: status } = useQuery({
+  const { data: status, isError, refetch } = useQuery({
     queryKey: ['job-status', jobId],
-    queryFn: () => getJobStatus(jobId),
+    queryFn: ({ signal }) => getJobStatus(jobId, signal),
     refetchInterval: (query) => {
       const s = query.state.data?.status;
       // stop polling once the import is done (either way)
-      return s === 'queued' || s === 'import_failed' ? false : 1500;
+      return s && s !== 'importing' ? false : 2500;
     },
     placeholderData: (prev) => prev,
     refetchOnWindowFocus: false,
@@ -278,13 +319,18 @@ useEffect(() => {
     notified.current = true;
     onFailed(status?.import_error ?? 'Import failed');
   }
-}, [s, status?.total_rows, status?.duplicates_removed, status?.import_error, onReady, onFailed]);
+  if (!notified.current && s && ['running', 'completed', 'failed'].includes(s)) {
+    notified.current = true;
+    onAlreadyStarted();
+  }
+}, [s, status?.total_rows, status?.duplicates_removed, status?.import_error, onReady, onFailed, onAlreadyStarted]);
 
   return (
     <Card className="p-12 flex flex-col items-center">
       <Loader2 className="h-10 w-10 text-brand-500 animate-spin mb-4" />
       <p className="text-sm font-medium text-slate-700">Extracting columns &amp; inserting rows…</p>
       <p className="text-xs text-slate-400 mt-1">Analyzing your file — this can take a moment for large files.</p>
+      {isError && <p role="alert" className="mt-4 text-sm text-rose-700">Could not check import progress. Your upload may still be importing. <button className="underline" onClick={() => void refetch()}>Retry status</button></p>}
     </Card>
   );
 }
@@ -296,34 +342,18 @@ function ProcessingView({ jobId, onComplete, onDashboard }: {
 }) {
   const navigated = useRef(false);
 
-  const { data: status, refetch } = useQuery({
-    queryKey: ['job-status-processing', jobId],
-    queryFn: () => getJobStatus(jobId),
-    refetchInterval: 2500,
-    refetchIntervalInBackground: true,
+  const { data: status, refetch, isError } = useQuery({
+    queryKey: ['job-status', jobId],
+    queryFn: ({ signal }) => getJobStatus(jobId, signal),
+    refetchInterval: (query) => ['completed', 'failed', 'import_failed'].includes(query.state.data?.status || '') ? false : 3000,
+    refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
     staleTime: 0,
-    gcTime: 0,                           // ← don't cache at all
   });
-
-  // Force an immediate fetch on mount
-  useEffect(() => {
-    refetch();
-  }, [refetch]);
-
-  useEffect(() => {
-    console.log('ProcessingView status update:', {
-      status: status?.status,
-      progress_pct: status?.progress_pct,
-      processed_rows: status?.processed_rows,
-      total_rows: status?.total_rows,
-    });
-  }, [status]);
 
   useEffect(() => {
     if (status?.status === 'completed' && !navigated.current) {
-      navigated.current = true;
-      const t = setTimeout(onComplete, 800);
+      const t = setTimeout(() => { navigated.current = true; onComplete(); }, 800);
       return () => clearTimeout(t);
     }
   }, [status?.status, onComplete]);
@@ -338,12 +368,14 @@ function ProcessingView({ jobId, onComplete, onDashboard }: {
       <Card className="p-12 flex flex-col items-center">
         <Loader2 className="h-10 w-10 text-brand-500 animate-spin mb-4" />
         <p className="text-sm font-medium text-slate-700">Connecting to processing pipeline…</p>
+        {isError && <p role="alert" className="mt-3 text-sm text-rose-700">Could not load progress. <button className="underline" onClick={() => void refetch()}>Retry</button></p>}
       </Card>
     );
   }
 
   return (
     <Card className="p-8">
+      {isError && <p role="alert" className="mb-4 text-sm text-rose-700">Progress could not be refreshed; the last saved status is shown. <button className="underline" onClick={() => void refetch()}>Retry status</button></p>}
       <div className="flex items-center gap-3 mb-6">
         {jobStatus === 'failed' ? (
           <XCircle className="h-8 w-8 text-rose-500" />
@@ -431,7 +463,7 @@ function ProcessingView({ jobId, onComplete, onDashboard }: {
 
       {jobStatus === 'failed' && (
         <div className="mt-6 rounded-xl bg-rose-50 ring-1 ring-rose-100 px-4 py-3 text-sm text-rose-600">
-          Processing failed. Please try uploading again or contact support.
+          This job could not finish successfully. Open it from the dashboard to inspect saved results, or contact an administrator before processing the file again.
         </div>
       )}
 

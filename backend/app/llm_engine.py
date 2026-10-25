@@ -92,13 +92,13 @@ def _call(
     Internal call. Returns (output_text, source_urls, TokenUsage).
     """
     tools = [_WEB_SEARCH_TOOL] if use_web_search else []
-    full_input = f"{system}\n\n{prompt}" if system else prompt
 
     t0 = time.monotonic()
     try:
         response = _client.responses.create(
             model=_DEPLOYMENT,
-            input=full_input,
+            input=prompt,
+            instructions=system,
             tools=tools,
             max_output_tokens=max_output_tokens,
             include=["web_search_call.action.sources"] if use_web_search else [],
@@ -264,19 +264,12 @@ Evaluate whether a lead matches a given ICP. Handle typos, abbreviations,
 and synonyms gracefully. Always return the exact JSON structure requested.
 No extra commentary.
 
-SENIORITY CLASSIFICATION:
-Strip noise (dept/scope qualifiers). Map the seniority keyword:
-- C-LEVEL (9-10): CEO/CTO/CFO/CIO/CISO/COO/CMO + variants, President, Founder, Owner
-- SENIOR EXEC (8-9): Managing Director, Partner, GM, Head of <function>
-- VP-LEVEL (6-8): VP/SVP/EVP/AVP, Vice President
-- DIRECTOR (5-7): Director, Senior Director
-- MANAGER (3-4): Manager, Senior Manager, Team Lead, Supervisor
-- IC (0-2): Analyst, Engineer, Specialist, Coordinator, Associate, Intern
-
-For compound titles (CIO/CISO, Managing Director AMLCO) use the HIGHEST tier.
-Decision-makers = C-Level, Senior Exec, VP, Director, Manager.
-Missing/ambiguous title = seniority_unknown in mismatches, NOT a disqualifier.
-Only disqualify seniority when title CLEARLY identifies an IC."""
+Classify seniority from the highest explicit tier in a compound title, but keep
+the complete function and title. Compare BOTH role/function and seniority with
+the user's actual requirements. Never impose a decision-maker tier the user did
+not request. A Finance VP is not automatically an IT/Operations VP.
+Missing or ambiguous evidence is unclear, not a proven mismatch. Do not output
+numeric scores or hidden disqualifiers; compare facts using the requested checks."""
 
 SYSTEM_WEB_RESEARCHER = """You are a B2B sales intelligence researcher.
 Use web search to verify company and contact details, find technology stacks,
@@ -284,10 +277,10 @@ identify growth signals, and summarise company profiles.
 Always include source URLs for every fact you state.
 Return structured JSON as instructed."""
 
-SYSTEM_SCORER = """You are a B2B sales lead scoring expert.
-You score leads from 0 to 100 based on ICP fit, decision-maker authority,
-data accuracy, growth signals, and contact quality.
-Always return the exact JSON structure requested with numeric scores and a reasoning paragraph."""
+SYSTEM_SCORER = """You draft B2B outreach using supplied qualification facts.
+Numeric scores and priorities are computed by application code. Do not invent
+or change them. Do not claim guaranteed email delivery or phone reachability.
+Return the exact JSON structure requested, grounded only in supplied evidence."""
 
 SYSTEM_CONTACT_VERIFIER = """You are a data quality analyst.
 Evaluate contact validation signals and summarise employment confirmation

@@ -26,9 +26,11 @@ Wire-in:
 
 import logging
 import uuid
+from datetime import datetime, timezone
+from celery.exceptions import Retry
 
 from app.celery_app import celery
-from app.database import db_session
+from app.database import locked_import_session
 from app.models import Job, Lead
 from app.parsers.excel_parser import parse_excel
 from app.parsers.csv_parser import parse_csv
@@ -60,8 +62,19 @@ def _cell(row: dict, key: str) -> str:
     acks_late=True,
 )
 def import_file(self, job_id: str, blob_name: str, suffix: str, filename: str):
+    try:
+        return _run_import(self, job_id, blob_name, suffix, filename)
+    except TimeoutError:
+        return  # Another delivered copy still owns this import's SQL lock.
+    except Retry:
+        raise
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=15)
+
+
+def _run_import(self, job_id: str, blob_name: str, suffix: str, filename: str):
     """Parse → map → dedup → bulk-insert. Marks the job queued or import_failed."""
-    with db_session() as db:
+    with locked_import_session(job_id) as db:
         try:
             job = db.query(Job).filter(Job.id == job_id).first()
         except Exception as e:
@@ -80,6 +93,10 @@ def import_file(self, job_id: str, blob_name: str, suffix: str, filename: str):
         try:
             if job.status != "importing":
                 return  # Celery redelivery must not append the same file twice.
+            if not job.source_blob_name or job.source_blob_name != blob_name:
+                return  # A transfer has not committed, or this delivery is stale.
+            job.dispatch_updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            db.commit()  # No row transaction remains open during Blob/AI parsing.
             raw_bytes = _download_blob(blob_name)
             if not raw_bytes:
                 _fail(db, job, "Could not read the uploaded file from storage.")
@@ -136,6 +153,11 @@ def import_file(self, job_id: str, blob_name: str, suffix: str, filename: str):
                     "notes":                _cell(row, "Notes"),
                     "processing_status":    "pending",
                 })
+                for column in Lead.__table__.columns:
+                    limit = getattr(column.type, "length", None)
+                    value = mappings[-1].get(column.name)
+                    if limit and isinstance(value, str) and len(value) > limit:
+                        raise ValueError(f"Row {idx + 1}: {column.name.replace('_', ' ')} exceeds {limit} characters.")
 
             transaction_lock(db, "ql:lead-import")
             db.refresh(job)
@@ -153,6 +175,7 @@ def import_file(self, job_id: str, blob_name: str, suffix: str, filename: str):
                 job.duplicates_removed = 0
             job.import_error = None
             job.status = "queued"
+            job.dispatch_updated_at = None
             db.flush()
 
             logger.info(f"import_file: job {job_id} imported {len(df)} leads "
@@ -165,6 +188,8 @@ def import_file(self, job_id: str, blob_name: str, suffix: str, filename: str):
         except Exception as e:
             logger.error(f"import_file failed for {job_id}: {e}")
             db.rollback()
+            if self.request.retries < self.max_retries:
+                raise self.retry(exc=e, countdown=15)
             _fail(db, job, "Import failed. Please retry or contact support.")
 
 
@@ -181,14 +206,16 @@ def _fail(db, job, message: str) -> None:
         logger.warning(f"import_file: job {getattr(job,'id','?')} import_failed: {message}")
     except Exception as e:
         logger.error(f"_fail could not update job: {e}")
+        raise
 
 
 def _download_blob(blob_name: str) -> bytes | None:
     try:
         from azure.storage.blob import BlobServiceClient
-        client = BlobServiceClient.from_connection_string(settings.AZURE_BLOB_CONNECTION_STRING)
-        container = client.get_container_client(settings.AZURE_BLOB_CONTAINER)
-        return container.get_blob_client(blob_name).download_blob().readall()
+        with BlobServiceClient.from_connection_string(settings.AZURE_BLOB_CONNECTION_STRING,
+                connection_timeout=10, read_timeout=60, retry_total=3) as client:
+            container = client.get_container_client(settings.AZURE_BLOB_CONTAINER)
+            return container.get_blob_client(blob_name).download_blob().readall()
     except Exception as e:
         logger.error(f"import_file: blob download failed for '{blob_name}': {e}")
-        return None
+        raise RuntimeError("Could not read uploaded data from storage") from e

@@ -1,7 +1,7 @@
-import { useState, useRef, useEffect, useLayoutEffect, useMemo, useId } from 'react';
+import { Fragment, useState, useRef, useEffect, useLayoutEffect, useMemo, useId } from 'react';
 import type { KeyboardEvent } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import {
   MessageSquare, X, Send, Loader2, Sparkles, ExternalLink, RefreshCw,
   AlertCircle, ArrowDown, Check, Pencil,
@@ -10,9 +10,13 @@ import { isAxiosError } from 'axios';
 import { getChatHistory, sendChat } from '@/api/endpoints';
 import { safeArr } from '@/lib/format';
 import type { ChatMessage, ChatRequest, ChatSelection } from '@/types';
-import ReactMarkdown from 'react-markdown';
+import { ChatMarkdown } from '@/components/ChatMarkdown';
 
 const MAX_MESSAGE_LENGTH = 4_000;
+const HISTORY_PAGE_SIZE = 100;
+const MAX_LOCAL_MESSAGES = 100;
+const EMPTY_MESSAGES: ChatMessage[] = [];
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface PendingTurn {
   request: ChatRequest;
@@ -47,10 +51,10 @@ function saveSessionValue(key: string, value: string | null): void {
   }
 }
 
-function conversationForJob(jobId: string): string {
-  const key = `lead-chat:conversation:${jobId}`;
+function conversationForJob(jobId: string, owner: string): string {
+  const key = `lead-chat:conversation:${encodeURIComponent(owner)}:${jobId}`;
   const stored = sessionValue(key);
-  if (stored && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(stored)) {
+  if (stored && UUID_PATTERN.test(stored)) {
     return stored;
   }
   const id = newId();
@@ -63,10 +67,25 @@ function readPendingTurn(key: string, conversationId: string): PendingTurn | nul
     const value = sessionValue(key);
     if (!value) return null;
     const turn: PendingTurn = JSON.parse(value);
-    if (turn.request?.conversation_id !== conversationId || !turn.request.request_id
-        || !turn.request.message || !turn.userMessage?.id) return null;
+    if (turn.request?.conversation_id !== conversationId || !UUID_PATTERN.test(turn.request.request_id)
+        || typeof turn.request.message !== 'string' || !turn.request.message.trim()
+        || turn.request.message.length > MAX_MESSAGE_LENGTH || turn.userMessage?.role !== 'user'
+        || turn.userMessage.id !== `local-${turn.request.request_id}`
+        || turn.userMessage.request_id !== turn.request.request_id || turn.userMessage.content !== turn.request.message
+        || !Number.isFinite(Date.parse(turn.userMessage.created_at))) return null;
+    if (turn.request.selection && (!['company', 'person'].includes(turn.request.selection.kind)
+        || typeof turn.request.selection.value !== 'string' || !turn.request.selection.value.trim()
+        || turn.request.selection.value.length > 500)) return null;
+    if (turn.failure && (typeof turn.failure.message !== 'string' || typeof turn.failure.canEdit !== 'boolean')) turn.failure = undefined;
     return turn;
   } catch { return null; }
+}
+
+function savedMessage(value: ChatMessage | undefined, role: 'user' | 'assistant', requestId: string): value is ChatMessage {
+  return Boolean(value && typeof value.id === 'string' && !value.id.startsWith('local-')
+    && value.role === role && value.request_id === requestId && typeof value.content === 'string'
+    && value.content.trim() && Number.isInteger(value.sequence) && value.sequence > 0
+    && Number.isFinite(Date.parse(value.created_at)));
 }
 
 function messageKey(message: ChatMessage): string {
@@ -125,16 +144,23 @@ function requestError(error: unknown): SendFailure {
 
 /** A keyed session prevents an old request or history response from entering a different job. */
 export function ChatWidget({ jobId }: { jobId: string }) {
-  return <ChatSession key={jobId} jobId={jobId} />;
+  const owner = localStorage.getItem('username') ?? '';
+  return <ChatSession key={`${owner}:${jobId}`} jobId={jobId} owner={owner} />;
 }
 
-function ChatSession({ jobId }: { jobId: string }) {
+function ChatSession({ jobId, owner }: { jobId: string; owner: string }) {
   const [open, setOpen] = useState(false);
-  const [conversationId] = useState(() => conversationForJob(jobId));
-  const pendingKey = `lead-chat:pending:${jobId}:${conversationId}`;
+  const [conversationId] = useState(() => conversationForJob(jobId, owner));
+  const pendingKey = `lead-chat:pending:${encodeURIComponent(owner)}:${jobId}:${conversationId}`;
   const [restoredTurn] = useState(() => readPendingTurn(pendingKey, conversationId));
   const [pendingTurn, setPendingTurn] = useState<PendingTurn | null>(restoredTurn);
   const [localMsgs, setLocalMsgs] = useState<ChatMessage[]>(restoredTurn ? [restoredTurn.userMessage] : []);
+  const [earlierMessages, setEarlierMessages] = useState<ChatMessage[]>([]);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const [earlierError, setEarlierError] = useState<string | null>(null);
+  const [earlierTarget, setEarlierTarget] = useState<number | null>(null);
+  const [noEarlierMessages, setNoEarlierMessages] = useState(false);
+  const [unavailableGaps, setUnavailableGaps] = useState<number[]>([]);
   const [sendError, setSendError] = useState<SendFailure | null>(restoredTurn
     ? restoredTurn.failure ?? { message: 'The previous reply was interrupted. Retry to recover it and continue.', canEdit: false }
     : null);
@@ -144,17 +170,21 @@ function ChatSession({ jobId }: { jobId: string }) {
   const sendingRef = useRef(false);
   const mountedRef = useRef(true);
   const requestController = useRef<AbortController | null>(null);
+  const earlierController = useRef<AbortController | null>(null);
+  const earlierScroll = useRef<{ height: number; top: number; anchorKey?: string; anchorTop?: number } | null>(null);
+  const loadingEarlierRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const toggleRef = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const nearBottomRef = useRef(true);
+  const latestVisibleKey = useRef<string | null>(null);
   const panelId = useId();
   const qc = useQueryClient();
   const historyKey = useMemo(() => ['chat-history', jobId, conversationId], [jobId, conversationId]);
 
   const {
-    data: history = [], isPending: historyLoading, isError: historyError,
+    data: history = EMPTY_MESSAGES, isPending: historyLoading, isError: historyError,
     isFetching: historyFetching, refetch: reloadHistory,
   } = useQuery({
     queryKey: historyKey,
@@ -165,29 +195,38 @@ function ChatSession({ jobId }: { jobId: string }) {
     staleTime: 30_000,
   });
 
-  const messages = useMemo(() => mergeMessages(history, localMsgs), [history, localMsgs]);
+  const messages = useMemo(() => mergeMessages([...earlierMessages, ...history], localMsgs), [earlierMessages, history, localMsgs]);
   const latestAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
   const pendingHasReply = Boolean(pendingTurn && messages.some((message) =>
     message.request_id === pendingTurn.request.request_id && message.role === 'assistant'));
   const blockedByFailure = Boolean(pendingTurn && sendError && !pendingHasReply);
   const clarification = latestAssistant?.metadata?.clarification;
   const lastMessage = messages[messages.length - 1];
+  const firstSavedMessage = messages.find((message) => !message.id.startsWith('local-'));
+  const hasEarlierMessages = Boolean(firstSavedMessage && firstSavedMessage.sequence > 1 && !noEarlierMessages);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       requestController.current?.abort();
+      earlierController.current?.abort();
     };
   }, []);
 
   // History can recover a reply completed on the server after a client timeout or refresh.
   useEffect(() => {
-    if (!pendingHasReply || sending) return;
+    if (!pendingHasReply) return;
+    // A history refresh can finish before the original HTTP transfer recovers.
+    // Release the input immediately when its saved reply is already visible.
+    requestController.current?.abort();
+    requestController.current = null;
+    sendingRef.current = false;
+    setSending(false);
     setPendingTurn(null);
     setSendError(null);
     saveSessionValue(pendingKey, null);
-  }, [pendingHasReply, pendingKey, sending]);
+  }, [pendingHasReply, pendingKey]);
 
   const scrollToLatest = () => {
     nearBottomRef.current = true;
@@ -197,10 +236,24 @@ function ChatSession({ jobId }: { jobId: string }) {
 
   useLayoutEffect(() => {
     if (!open) return;
+    const latestKey = messages.length ? messageKey(messages[messages.length - 1]) : null;
+    const hasNewTurn = latestVisibleKey.current !== latestKey;
+    latestVisibleKey.current = latestKey;
+    if (earlierScroll.current && scrollRef.current) {
+      const previous = earlierScroll.current;
+      earlierScroll.current = null;
+      const anchor = [...(contentRef.current?.querySelectorAll<HTMLElement>('[data-chat-message-key]') ?? [])]
+        .find((element) => element.dataset.chatMessageKey === previous.anchorKey);
+      if (anchor && previous.anchorTop !== undefined) {
+        scrollRef.current.scrollTop += anchor.getBoundingClientRect().top - previous.anchorTop;
+      } else scrollRef.current.scrollTop = previous.top + scrollRef.current.scrollHeight - previous.height;
+      if (hasNewTurn && latestKey) setHasNewMessages(true);
+      return;
+    }
     if (nearBottomRef.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
       setHasNewMessages(false);
-    } else if (messages.length > 0) {
+    } else if (hasNewTurn && messages.length > 0) {
       setHasNewMessages(true);
     }
   }, [messages, sending, open]);
@@ -215,6 +268,52 @@ function ChatSession({ jobId }: { jobId: string }) {
     observer.observe(contentRef.current);
     return () => observer.disconnect();
   }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const frame = requestAnimationFrame(() => inputRef.current?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(frame);
+  }, [open]);
+
+  const loadEarlier = async (beforeSequence?: number) => {
+    const oldest = messages.find((message) => !message.id.startsWith('local-'));
+    const before = beforeSequence ?? oldest?.sequence;
+    if (!before || before <= 1 || loadingEarlierRef.current) return;
+    loadingEarlierRef.current = true;
+    setLoadingEarlier(true);
+    setEarlierError(null);
+    setEarlierTarget(before);
+    const controller = new AbortController();
+    earlierController.current = controller;
+    try {
+      const page = await getChatHistory(jobId, conversationId, controller.signal, before, HISTORY_PAGE_SIZE);
+      if (!mountedRef.current || controller.signal.aborted) return;
+      const known = new Set(messages.map(messageKey));
+      if (!page.some((message) => !known.has(messageKey(message)))) {
+        if (beforeSequence) setUnavailableGaps((previous) => [...previous, beforeSequence]);
+        else setNoEarlierMessages(true);
+        return;
+      }
+      if (scrollRef.current) {
+        const visibleTop = scrollRef.current.getBoundingClientRect().top;
+        const anchor = [...(contentRef.current?.querySelectorAll<HTMLElement>('[data-chat-message-key]') ?? [])]
+          .find((element) => element.getBoundingClientRect().bottom >= visibleTop);
+        earlierScroll.current = { height: scrollRef.current.scrollHeight, top: scrollRef.current.scrollTop,
+          anchorKey: anchor?.dataset.chatMessageKey, anchorTop: anchor?.getBoundingClientRect().top };
+        nearBottomRef.current = false;
+        setHasNewMessages(false);
+      }
+      // The latest-page query may move forward while older pages are loading.
+      // Retain the current visible history too, so that no intervening turn is lost.
+      setEarlierMessages((previous) => mergeMessages(page, mergeMessages(previous, history)));
+    } catch {
+      if (mountedRef.current && !controller.signal.aborted) setEarlierError('Earlier messages could not load. Retry to keep reading.');
+    } finally {
+      loadingEarlierRef.current = false;
+      earlierController.current = null;
+      if (mountedRef.current) setLoadingEarlier(false);
+    }
+  };
 
   const handleOpen = () => {
     if (!open) nearBottomRef.current = true;
@@ -243,8 +342,11 @@ function ChatSession({ jobId }: { jobId: string }) {
 
     try {
       const response = await sendChat(jobId, turn.request, controller.signal);
-      if (!mountedRef.current) return;
-      if (!response.user_message?.id || !response.assistant_message?.id) {
+      if (!mountedRef.current || controller.signal.aborted) return;
+      if (!savedMessage(response.user_message, 'user', turn.request.request_id)
+          || !savedMessage(response.assistant_message, 'assistant', turn.request.request_id)
+          || response.assistant_message.sequence !== response.user_message.sequence + 1
+          || response.user_message.content !== turn.request.message) {
         throw new Error('Chat response did not contain persisted messages.');
       }
       const assistant: ChatMessage = {
@@ -260,8 +362,12 @@ function ChatSession({ jobId }: { jobId: string }) {
       // Keep a session overlay as well as the cache: an older in-flight history read
       // cannot erase a newly acknowledged reply or move its optimistic user message.
       setLocalMsgs((previous) => mergeMessages(previous.filter((message) =>
-        message.request_id !== turn.request.request_id), persisted));
-      qc.setQueryData<ChatMessage[]>(historyKey, (previous) => mergeMessages(previous ?? [], persisted));
+        message.request_id !== turn.request.request_id), persisted).slice(-MAX_LOCAL_MESSAGES));
+      const previousPage = qc.getQueryData<ChatMessage[]>(historyKey) ?? [];
+      const updatedPage = mergeMessages(previousPage, mergeMessages(localMsgs.filter((message) => !message.id.startsWith('local-')), persisted));
+      const dropped = updatedPage.slice(0, Math.max(0, updatedPage.length - HISTORY_PAGE_SIZE));
+      if (dropped.length) setEarlierMessages((previous) => previous.length ? mergeMessages(previous, dropped) : previous);
+      qc.setQueryData<ChatMessage[]>(historyKey, updatedPage.slice(-HISTORY_PAGE_SIZE));
       setPendingTurn(null);
       setSendError(null);
       saveSessionValue(pendingKey, null);
@@ -274,11 +380,13 @@ function ChatSession({ jobId }: { jobId: string }) {
         saveSessionValue(pendingKey, JSON.stringify(failedTurn));
       }
     } finally {
-      sendingRef.current = false;
-      requestController.current = null;
-      if (mountedRef.current) {
-        setSending(false);
-        if (nearBottomRef.current) inputRef.current?.focus({ preventScroll: true });
+      if (requestController.current === controller) {
+        sendingRef.current = false;
+        requestController.current = null;
+        if (mountedRef.current) {
+          setSending(false);
+          if (nearBottomRef.current) inputRef.current?.focus({ preventScroll: true });
+        }
       }
     }
   };
@@ -348,8 +456,8 @@ function ChatSession({ jobId }: { jobId: string }) {
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 20, scale: 0.95 }}
             transition={{ type: 'spring', stiffness: 300, damping: 26 }}
-            onKeyDown={(event) => { if (event.key === 'Escape') closeChat(); }}
-            className="fixed bottom-24 right-3 sm:right-6 z-40 flex flex-col w-[calc(100vw-1.5rem)] sm:w-[28rem] h-[36rem] max-h-[calc(100dvh-7rem)] rounded-2xl bg-white shadow-card-hover ring-1 ring-slate-200 overflow-hidden"
+            onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); closeChat(); } }}
+            className="fixed bottom-24 right-3 sm:right-6 z-40 flex flex-col w-[calc(100vw-1.5rem)] sm:w-[38rem] lg:w-[42rem] max-w-[calc(100vw-1.5rem)] h-[40rem] max-h-[calc(100dvh-7rem)] rounded-2xl bg-white shadow-card-hover ring-1 ring-slate-200 overflow-hidden"
           >
             <div className="flex items-center gap-2.5 bg-brand-gradient px-4 py-3 text-white">
               <Sparkles className="h-5 w-5 shrink-0" />
@@ -382,6 +490,14 @@ function ChatSession({ jobId }: { jobId: string }) {
               }}
               className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 bg-slate-50/40">
               <div ref={contentRef} role="log" aria-label="Conversation" aria-live="polite" aria-relevant="additions" className="space-y-3">
+                {hasEarlierMessages && <div className="text-center">
+                  <button type="button" onClick={() => { void loadEarlier(); }} disabled={loadingEarlier}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-50">
+                    {loadingEarlier && <Loader2 className="h-3 w-3 animate-spin" />}
+                    {loadingEarlier ? 'Loading earlier messages…' : 'Load earlier messages'}
+                  </button>
+                  {earlierError && earlierTarget === firstSavedMessage?.sequence && <p role="status" className="mt-1 text-xs text-rose-700">{earlierError}</p>}
+                </div>}
                 {historyLoading && messages.length === 0 ? (
                   <div role="status" className="flex items-center justify-center gap-2 py-8 text-xs text-slate-500">
                     <Loader2 className="h-5 w-5 text-brand-400 animate-spin" /> Loading conversation…
@@ -396,18 +512,26 @@ function ChatSession({ jobId }: { jobId: string }) {
                       Ask about a company, contact, score, ICP proof, or any row in this session. For example: “Show me row 500”.
                     </p>
                   </div>
-                ) : messages.map((message) => (
-                  <MessageBubble key={messageKey(message)} msg={message}
+                ) : messages.map((message, index) => (
+                  <Fragment key={messageKey(message)}>
+                  {index > 0 && !message.id.startsWith('local-') && !messages[index - 1].id.startsWith('local-')
+                    && message.sequence > messages[index - 1].sequence + 1 && <div className="text-center text-xs text-slate-500">
+                      {unavailableGaps.includes(message.sequence) ? 'Messages in this range are no longer available.' : <button type="button"
+                        onClick={() => { void loadEarlier(message.sequence); }} disabled={loadingEarlier}
+                        className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 hover:bg-slate-100 disabled:opacity-50">
+                        {loadingEarlier ? 'Loading messages…' : 'Load messages in this gap'}
+                      </button>}
+                      {earlierError && earlierTarget === message.sequence && <p role="status" className="mt-1 text-xs text-rose-700">{earlierError}</p>}
+                    </div>}
+                  <MessageBubble msg={message}
+                    onSourcesToggle={() => { nearBottomRef.current = false; }}
                     onChoice={message.id === latestAssistant?.id && lastMessage?.role === 'assistant'
                       ? (selection) => handleSend(selection) : undefined}
                     choicesDisabled={sending || blockedByFailure || historyLoading} />
+                  </Fragment>
                 ))}
 
-                {sending && (
-                  <div role="status" className="flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-xs text-slate-500 ring-1 ring-slate-100">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-brand-600" /> Looking through this session's leads…
-                  </div>
-                )}
+                {sending && !pendingHasReply && <ThinkingIndicator />}
                 {blockedByFailure && pendingTurn && (
                   <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-900">
                     <p>{sendError?.message}</p>
@@ -471,7 +595,7 @@ function ChatSession({ jobId }: { jobId: string }) {
 }
 
 function sourceUrl(value: string): string | null {
-  if (!value || !value.trim()) return null;
+  if (typeof value !== 'string' || !value.trim()) return null;
   if (/^[a-z][a-z0-9+.-]*:/i.test(value.trim()) && !/^https?:\/\//i.test(value.trim())) return null;
   const candidate = /^https?:\/\//i.test(value.trim()) ? value.trim() : `https://${value.trim()}`;
   try {
@@ -481,29 +605,56 @@ function sourceUrl(value: string): string | null {
   } catch { return null; }
 }
 
-function MessageBubble({ msg, onChoice, choicesDisabled }: {
+function ThinkingIndicator() {
+  const reducedMotion = useReducedMotion();
+  return <div role="status" aria-label="Assistant is thinking" className="flex w-fit items-center gap-2.5 rounded-2xl rounded-bl-md bg-white px-4 py-3 text-xs text-slate-500 ring-1 ring-slate-200">
+    <span>Thinking</span>
+    <span aria-hidden="true" className="flex items-center gap-1">
+      {[0, 1, 2].map((index) => <motion.span key={index}
+        className="block h-1.5 w-1.5 rounded-full bg-brand-500"
+        animate={reducedMotion ? undefined : { y: [0, -3, 0], opacity: [0.4, 1, 0.4] }}
+        transition={{ duration: 0.9, delay: index * 0.15, repeat: Infinity, ease: 'easeInOut' }} />)}
+    </span>
+  </div>;
+}
+
+function MessageBubble({ msg, onChoice, choicesDisabled, onSourcesToggle }: {
   msg: ChatMessage;
   onChoice?: (selection: ChatSelection) => void;
   choicesDisabled: boolean;
+  onSourcesToggle?: () => void;
 }) {
+  const [showAllSources, setShowAllSources] = useState(false);
   const isUser = msg.role === 'user';
-  const sources = safeArr(msg.sources);
-  const choices = safeArr(msg.metadata?.clarification?.choices);
+  const sources = useMemo(() => {
+    const unique = new Map<string, { href: string; label: string; title: string }>();
+    for (const source of safeArr(msg.sources)) {
+      if (!source || typeof source.website_url !== 'string') continue;
+      const href = sourceUrl(source.website_url);
+      if (!href) continue;
+      const url = new URL(href);
+      url.hash = '';
+      for (const name of [...url.searchParams.keys()]) if (/^utm_|^(?:gclid|fbclid)$/i.test(name)) url.searchParams.delete(name);
+      url.searchParams.sort();
+      const key = `${url.host.replace(/^www\./, '')}${url.pathname.replace(/\/$/, '')}${url.search}`;
+      const label = typeof source.title === 'string' && source.title.trim() ? source.title.slice(0, 160) : url.hostname.replace(/^www\./, '');
+      const title = typeof source.excerpt === 'string' && source.excerpt.trim() ? source.excerpt
+        : typeof source.company_name === 'string' && source.company_name.trim() ? source.company_name : url.hostname;
+      if (!unique.has(key)) unique.set(key, { href, label, title });
+    }
+    return [...unique.values()];
+  }, [msg.sources]);
+  const choices = safeArr(msg.metadata?.clarification?.choices).filter((choice) => choice
+    && ['company', 'person'].includes(choice.kind) && typeof choice.value === 'string'
+    && choice.value.trim() && typeof choice.label === 'string');
 
   return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+    <div data-chat-message-key={messageKey(msg)} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div className={`min-w-0 max-w-[92%] ${isUser ? '' : 'w-full'}`}>
         <div className={`rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed break-words ${isUser
           ? 'bg-brand-600 text-white rounded-br-md whitespace-pre-wrap'
           : 'bg-white text-slate-700 ring-1 ring-slate-100 rounded-bl-md'}`}>
-          {isUser ? msg.content || '—' : (
-            <div className="prose prose-sm max-w-none prose-slate prose-p:my-1 prose-ol:my-1 prose-ul:my-1 prose-li:my-0.5 prose-a:text-sky-600 prose-pre:overflow-x-auto prose-code:break-words">
-              <ReactMarkdown components={{
-                a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>,
-                img: ({ alt }) => <span>{alt || 'Image'}</span>,
-              }}>{msg.content || '—'}</ReactMarkdown>
-            </div>
-          )}
+          {isUser ? msg.content || '—' : <ChatMarkdown content={msg.content || '—'} />}
         </div>
 
         {!isUser && msg.metadata?.degraded && (
@@ -522,20 +673,13 @@ function MessageBubble({ msg, onChoice, choicesDisabled }: {
           </div>
         )}
 
-        {sources.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mt-2">
-            {sources.map((source) => {
-              const url = sourceUrl(source.website_url);
-              if (!url) return null;
-              return (
-                <a key={`${source.company_name}:${url}`} href={url} target="_blank" rel="noopener noreferrer"
-                  className="inline-flex max-w-full items-center gap-1 rounded-lg bg-sky-50 px-2 py-0.5 text-xs text-sky-700 ring-1 ring-sky-200 hover:bg-sky-100 transition-colors">
-                  <span className="truncate">{source.company_name || 'Source'}</span><ExternalLink className="h-3 w-3 shrink-0" />
-                </a>
-              );
-            })}
-          </div>
-        )}
+        {!isUser && sources.length > 0 && <div className="mt-2 space-y-1.5" aria-label="Supporting sources">
+          <div className="flex flex-wrap gap-1.5">{(showAllSources ? sources : sources.slice(0, 2)).map((source) => <a key={source.href} href={source.href} target="_blank" rel="noopener noreferrer" title={source.title}
+            className="inline-flex max-w-full items-center gap-1 rounded-lg bg-sky-50 px-2 py-1 text-xs text-sky-700 ring-1 ring-sky-200 hover:bg-sky-100">
+            <span className="max-w-[220px] truncate">{source.label}</span><ExternalLink className="h-3 w-3 shrink-0" />
+          </a>)}</div>
+          {sources.length > 2 && <button type="button" aria-expanded={showAllSources} onClick={() => { onSourcesToggle?.(); setShowAllSources((value) => !value); }} className="rounded px-1 py-1 text-xs font-medium text-sky-700 hover:underline">{showAllSources ? 'See less' : `See more sources (${sources.length - 2})`}</button>}
+        </div>}
       </div>
     </div>
   );

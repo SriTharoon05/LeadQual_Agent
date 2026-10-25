@@ -51,7 +51,7 @@ celery = Celery(
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL,
     include=["app.tasks.tasks", "app.tasks.embed_task", "app.tasks.import_task",
-             "app.tasks.refresh_task"],
+             "app.tasks.refresh_task", "app.tasks.export_task", "app.tasks.dispatch_task"],
 )
 
 # Concurrency from .env (MAX_WORKERS). CLI --concurrency still overrides this.
@@ -77,6 +77,7 @@ celery.conf.update(
         "app.tasks.import_task.*": {"queue": settings.CELERY_IMPORT_QUEUE},
         "app.tasks.embed_task.*": {"queue": settings.CELERY_EMBED_QUEUE},
         "app.tasks.refresh_task.*": {"queue": CELERY_QUEUE_NAME},
+        "app.tasks.export_task.*": {"queue": settings.CELERY_EXPORT_QUEUE},
     },
 
     # Worker behaviour — threads pool suits this I/O-bound pipeline.
@@ -101,13 +102,16 @@ celery.conf.update(
 
 # ── Qdrant bootstrap — on worker startup, NOT on import ───────────────────────
 @worker_ready.connect
-def _bootstrap_qdrant(**_kwargs):
+def _bootstrap_qdrant(sender=None, **_kwargs):
     """
     Ensure the Qdrant collection + payload indexes exist, once, when a worker
     comes up. Guarded: a Qdrant outage logs a warning but never prevents the
     worker from starting (embed tasks retry, and ensure_collection is idempotent
     so it can run again on the next worker boot).
     """
+    queues = getattr(getattr(sender, "task_consumer", None), "queues", ())
+    if queues and settings.CELERY_EMBED_QUEUE not in {queue.name for queue in queues}:
+        return
     try:
         from app.vectorstore.qdrant_store import ensure_collection
         ensure_collection()

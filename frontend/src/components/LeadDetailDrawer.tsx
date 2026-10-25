@@ -33,10 +33,8 @@ function LeadDetailContent({ lead, jobId, onSaved }: { lead: LeadResult; jobId: 
   const outreach = parseOutreach(lead.outreach_intelligence);
   const radarData = [
     { metric: 'ICP',      value: numVal(lead.icp_score) },
-    { metric: 'Authority',value: numVal(lead.authority_score) },
-    { metric: 'Data',     value: numVal(lead.data_score) },
-    { metric: 'Growth',   value: numVal(lead.growth_score) },
     { metric: 'Contact',  value: numVal(lead.contact_score) },
+    { metric: 'Growth',   value: numVal(lead.growth_score) },
   ];
   const hasScores = radarData.some((d) => d.value > 0);
 
@@ -51,9 +49,9 @@ function LeadDetailContent({ lead, jobId, onSaved }: { lead: LeadResult; jobId: 
           <div>
             <h3 className="text-lg font-bold text-slate-800">{dash(lead.company_name)}</h3>
             <p className="text-sm text-slate-500">{dash(lead.job_title)}</p>
+            {lead.row_number != null && <p className="mt-1 text-xs text-slate-400">Stored row {lead.row_number} · Use this number in chat</p>}
             <div className="flex items-center gap-2 mt-2">
               <PriorityBadge priority={lead.priority} />
-              {lead.validation_status && <Badge color={lead.validation_status === 'Passed' ? 'success' : 'warning'}>{lead.validation_status}</Badge>}
             </div>
           </div>
         </div>
@@ -122,6 +120,7 @@ function LeadDetailContent({ lead, jobId, onSaved }: { lead: LeadResult; jobId: 
 
       {/* Scoring block */}
       <Section icon={<Award className="h-4 w-4" />} title="Scoring Breakdown">
+        <p className="mb-4 text-xs leading-relaxed text-slate-500">ICP 60% · Contact availability 25% · Sourced growth 15%. Required ICP checks plus one permitted contact route qualify a lead as High. Growth ranks qualified leads; unknown inbox delivery is not a failure.</p>
         {hasScores ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-center">
             <div className="h-[200px]">
@@ -136,10 +135,9 @@ function LeadDetailContent({ lead, jobId, onSaved }: { lead: LeadResult; jobId: 
             </div>
             <div className="space-y-2">
               <ScoreRow label="ICP Score"       value={lead.icp_score} />
-              <ScoreRow label="Authority Score" value={lead.authority_score} />
-              <ScoreRow label="Data Score"      value={lead.data_score} />
-              <ScoreRow label="Growth Score"    value={lead.growth_score} />
               <ScoreRow label="Contact Score"   value={lead.contact_score} />
+              <ScoreRow label="Growth Score"    value={lead.growth_score} />
+              {lead.scoring_details?.raw_weighted_score != null && lead.final_score != null && lead.scoring_details.raw_weighted_score > lead.final_score + 0.05 && <p className="pt-2 text-xs leading-relaxed text-amber-800">Weighted score {num(lead.scoring_details.raw_weighted_score)} → final score {num(lead.final_score)} after qualification limits. See the ICP/contact proofs and qualification summary for the reason.</p>}
             </div>
           </div>
         ) : (

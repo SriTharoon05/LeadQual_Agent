@@ -1,4 +1,5 @@
-import { lazy, Suspense, useDeferredValue, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import { useDebouncedValue } from '@/hooks/useDebouncedValue';
 import { Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { isAxiosError } from 'axios';
@@ -32,15 +33,17 @@ export function LeadWorkspacePage() {
   const [groupError, setGroupError] = useState('');
   const [selected, setSelected] = useState<{ jobId: string; lead: LeadResult } | null>(null);
   const opening = useRef(0);
+  const detailRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => { opening.current++; detailRequest.current?.abort(); }, []);
   const team = useQuery({ queryKey: ['workspace-team'], queryFn: getTeam, refetchInterval: 60_000 });
   const segments = useQuery({ queryKey: ['workspace-segments'], queryFn: getSegments, refetchInterval: 60_000 });
   const activeSegment = segments.data?.find((group) => group.id === selectedSegment);
-  const deferredSearch = useDeferredValue(filters.search?.trim() || '');
+  const deferredSearch = useDebouncedValue(filters.search?.trim() || '');
   const requestFilters = { ...filters, search: deferredSearch || undefined };
   const segmentId = selectedSegment && !groupDirty ? selectedSegment : undefined;
   const leads = useQuery({
     queryKey: ['workspace-leads', segmentId, activeSegment?.version, segmentId ? null : requestFilters, page],
-    queryFn: () => getWorkspaceLeads(requestFilters, page * PAGE_SIZE, PAGE_SIZE, segmentId),
+    queryFn: ({ signal }) => getWorkspaceLeads(requestFilters, page * PAGE_SIZE, PAGE_SIZE, segmentId, signal),
     refetchInterval: 60_000,
   });
   const total = leads.data?.total || 0;
@@ -101,8 +104,11 @@ export function LeadWorkspacePage() {
   };
   const openLead = async (item: WorkspaceLead) => {
     const request = ++opening.current;
+    detailRequest.current?.abort();
+    const controller = new AbortController();
+    detailRequest.current = controller;
     try {
-      const lead = await getLeadDetail(item.job_id, item.lead_id);
+      const lead = await getLeadDetail(item.job_id, item.lead_id, controller.signal);
       if (request === opening.current) setSelected({ jobId: item.job_id, lead });
     } catch { if (request === opening.current) toast('Could not load this lead', 'error'); }
   };
@@ -112,7 +118,7 @@ export function LeadWorkspacePage() {
     <TopBar />
     <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8 space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div><h1 className="text-2xl font-bold text-slate-800">Lead workspace</h1><p className="mt-1 text-sm text-slate-500">All uploads, with one current record per lead. Owner, review, notes, and follow-up stay shared.</p></div>
+        <div><h1 className="text-2xl font-bold text-slate-800">Lead workspace</h1><p className="mt-1 text-sm text-slate-500">All uploads, one current record per lead, highest qualification score first. Owner, review, notes, and follow-up stay shared.</p></div>
         <Link to="/dashboard"><Button variant="outline" size="sm" icon={<Users className="h-4 w-4" />}>Team &amp; reminders</Button></Link>
       </div>
       <Card className="p-5 space-y-4">

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { isAxiosError } from 'axios';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Pencil, Plus, Users } from 'lucide-react';
@@ -19,6 +19,7 @@ export function TeamDirectory() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const [error, setError] = useState('');
 
   const begin = (member: TeamMember | null) => {
@@ -26,7 +27,8 @@ export function TeamDirectory() {
   };
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (saving || !name.trim()) return;
+    if (savingRef.current || !name.trim()) return;
+    savingRef.current = true;
     setSaving(true); setError('');
     try {
       if (editing) await updateTeamMember(editing.id, { version: editing.version, name: name.trim(), email: email.trim() || null });
@@ -45,10 +47,11 @@ export function TeamDirectory() {
         const detail = isAxiosError(cause) ? cause.response?.data?.detail : undefined;
         setError(typeof detail === 'string' ? detail : 'Could not save this team member. Your draft is retained.');
       }
-    } finally { setSaving(false); }
+    } finally { savingRef.current = false; setSaving(false); }
   };
   const toggleActive = async (member: TeamMember) => {
-    if (saving) return;
+    if (savingRef.current) return;
+    savingRef.current = true;
     setSaving(true); setError('');
     try {
       await updateTeamMember(member.id, { version: member.version, active: !member.active });
@@ -58,7 +61,7 @@ export function TeamDirectory() {
     } catch (cause) {
       setError(isAxiosError(cause) && cause.response?.status === 409 ? 'This member changed elsewhere. The latest directory is loaded; try again.' : 'Could not change this member. Please try again.');
       await team.refetch();
-    } finally { setSaving(false); }
+    } finally { savingRef.current = false; setSaving(false); }
   };
 
   return <Card className="p-5 space-y-4">

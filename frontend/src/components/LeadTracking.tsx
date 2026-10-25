@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { isAxiosError } from 'axios';
 import { useQueryClient } from '@tanstack/react-query';
 import { updateLeadTracking, getLeadDetail } from '@/api/endpoints';
@@ -12,13 +12,15 @@ export function LeadTracking({ lead, jobId, onSaved, notes = false }: Props) {
   const [draft, setDraft] = useState(lead.tracking_notes || '');
   const [notesDirty, setNotesDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const [pendingReviewed, setPendingReviewed] = useState<boolean | null>(null);
   const [error, setError] = useState('');
   const qc = useQueryClient();
   const { toast } = useToast();
   useEffect(() => { if (!notesDirty) setDraft(lead.tracking_notes || ''); }, [lead.tracking_notes, notesDirty]);
   const save = async (changes: { reviewed?: boolean; notes?: string }) => {
-    if (saving) return;
+    if (savingRef.current) return;
+    savingRef.current = true;
     if (changes.reviewed !== undefined) setPendingReviewed(changes.reviewed);
     setSaving(true); setError('');
     try {
@@ -33,10 +35,11 @@ export function LeadTracking({ lead, jobId, onSaved, notes = false }: Props) {
       setError(message);
       toast(message, 'error');
       if (conflict) {
-        try { onSaved(await getLeadDetail(jobId, lead.lead_id)); } catch { /* keep draft */ }
+        try { onSaved(await getLeadDetail(jobId, lead.lead_id)); }
+        catch { setError('Your draft is retained, but the latest saved details could not be loaded. Reload before saving again.'); }
         await invalidateLeadWorkspace(qc);
       }
-    } finally { setSaving(false); setPendingReviewed(null); }
+    } finally { savingRef.current = false; setSaving(false); setPendingReviewed(null); }
   };
   return <div onClick={(event) => event.stopPropagation()} className={notes ? 'space-y-3' : ''}>
     <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-slate-700">

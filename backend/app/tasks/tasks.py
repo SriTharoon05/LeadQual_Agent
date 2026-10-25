@@ -19,9 +19,9 @@ from app.utils.lead_identity import reusable_lead, copy_result, json_object
 from app.utils.logger import pipeline_logger
 from app.utils.company_logger import CompanyLogger
 
-from app.validators.icp_validator import _s, validate_icp
+from app.validators.icp_validator import ICPResult, _s, validate_icp
 from app.validators.web_researcher import research_lead
-from app.validators.contact_verifier import verify_contact
+from app.validators.contact_verifier import ContactVerifyResult, verify_contact
 from app.scoring.scoring_engine import score_lead
 from app.utils.monitor import bind_context
 # RAG ingestion hook (persist scrape + fire async embedding into Qdrant)
@@ -59,6 +59,36 @@ def _num(value, default: float = 0.0) -> float:
             except Exception:
                 return default
     return default
+
+
+def _require_stage_result(result, stage: str) -> None:
+    """Service/parse failures are retryable, not low-quality lead evidence."""
+    payload = json_object(getattr(result, "raw_output", None))
+    if (result is None or not payload or getattr(result, "error", None)
+            or payload.get("error") or payload.get("fallback")):
+        raise RuntimeError(f"{stage} did not produce a successful result")
+    if stage == "web" and (not isinstance(payload.get("evidence"), dict)
+                           or not payload["evidence"]):
+        raise RuntimeError("Web research did not return structured evidence")
+    if stage == "icp" and not payload.get("checks"):
+        raise RuntimeError("ICP validation did not return structured checks")
+    if stage == "contact" and not isinstance(payload.get("methods"), list):
+        raise RuntimeError("Contact verification did not return structured observations")
+
+
+def _restore_stage_result(row, result_type, stage: str):
+    """Resume a previously committed successful stage after worker retries."""
+    if row is None:
+        return None
+    try:
+        payload = json_object(row.raw_output)
+        result = result_type(**{key: value for key, value in payload.items()
+                               if key in result_type.__dataclass_fields__})
+        result.raw_output = row.raw_output
+        _require_stage_result(result, stage)
+        return result
+    except (RuntimeError, TypeError, ValueError):
+        return None
 
 
 class _NullLog:
@@ -127,6 +157,9 @@ def _process_lead(self, db, lead_id, icp_prompt):
         _mark_lead_finished(db, lead, failed=False)
         return
     source, reuse_kind = reusable_lead(db, lead, icp_prompt)
+    if (source and reuse_kind == "full" and lead.evidence_checked_at is not None
+            and (source.evidence_checked_at is None or source.evidence_checked_at < lead.evidence_checked_at)):
+        source, reuse_kind = None, None  # Resume this attempt's newer saved research.
     if source and reuse_kind == "full":
         # Clear incomplete stage rows left by a previous attempt before copying.
         db.query(ValidationResult).filter(ValidationResult.lead_id == lead.id).delete()
@@ -160,22 +193,17 @@ def _process_lead(self, db, lead_id, icp_prompt):
         cache_key = "ql:web:v2:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
         cached_web = None
         previous_web = db.query(ValidationResult).filter_by(lead_id=lead.id, stage="web").first()
-        if previous_web:
-            saved_data = json_object(previous_web.raw_output)
-            if saved_data.get("evidence") and not saved_data.get("error"):
-                cached_web = WebResearchResult(**{
-                    key: value for key, value in saved_data.items()
-                    if key in WebResearchResult.__dataclass_fields__})
-                cached_web.raw_output = previous_web.raw_output
-        if source and reuse_kind == "research":
+        cached_web = _restore_stage_result(previous_web, WebResearchResult, "web")
+        resuming_saved_web = cached_web is not None
+        if cached_web is None and source and reuse_kind == "research":
             saved = next(v for v in source.validation_results if v.stage == "web")
-            data = json_object(saved.raw_output)
-            cached_web = WebResearchResult(**{
-                key: value for key, value in data.items()
-                if key in WebResearchResult.__dataclass_fields__})
-            cached_web.raw_output = saved.raw_output
-            lead.reused_from_lead_id = source.reused_from_lead_id or source.id
-            lead.reuse_kind = "research"
+            cached_web = _restore_stage_result(saved, WebResearchResult, "web")
+            if cached_web is not None:
+                lead.reused_from_lead_id = source.reused_from_lead_id or source.id
+                lead.reuse_kind = "research"
+        # Release all read/write transactions before Redis, DNS or AI calls.
+        # The session-owned identity lock remains held across these commits.
+        db.commit()
         if cached_web is None:
             cached_web = _get_cached_web(cache_key)
 
@@ -185,7 +213,9 @@ def _process_lead(self, db, lead_id, icp_prompt):
         else:
             web_result = research_lead(lead_data,
                                        job_id=lead.job_id, lead_id=lead_id)
+            _require_stage_result(web_result, "web")
             _set_cached_web(cache_key, web_result)
+        _require_stage_result(web_result, "web")
 
         clog.stage("STAGE 2: WEB RESEARCH", web_result,
                    source=research_lead, inputs=lead_data, started=t0)
@@ -207,16 +237,26 @@ def _process_lead(self, db, lead_id, icp_prompt):
 
 
         # ── RAG ingestion (best-effort) ───────────────────────────────────
-        if not source:
-            try:
-                persist_and_dispatch_embed(db, lead, web_result, clog=clog)
-            except Exception as e:
-                logger.warning(f"RAG ingestion skipped for {lead_id}: {e}")
+        try:
+            # A research-only reuse still needs this job's own saved website
+            # document; chat deliberately cannot traverse another upload.
+            persist_and_dispatch_embed(db, lead, web_result, clog=clog)
+        except Exception as e:
+            logger.warning(f"RAG ingestion skipped for {lead_id}: {e}")
 
         # ── Stage 3: Contact Verification ─────────────────────────────────
         log.info("Stage 3: Contact verification")
         t0 = datetime.now(timezone.utc)
-        contact_result = verify_contact(lead_data, web_result)
+        contact_result = None
+        if resuming_saved_web:
+            saved_contact = db.query(ValidationResult).filter_by(
+                lead_id=lead_id, stage="contact").first()
+            contact_result = _restore_stage_result(saved_contact, ContactVerifyResult, "contact")
+        resuming_saved_contact = contact_result is not None
+        db.commit()
+        if contact_result is None:
+            contact_result = verify_contact(lead_data, web_result, icp_prompt=icp_prompt)
+        _require_stage_result(contact_result, "contact")
         clog.stage("STAGE 3: CONTACT VERIFICATION", contact_result,
                    source=verify_contact, inputs=lead_data, started=t0)
         log.info("  ↳ Stage 3 output: " + _summarise(
@@ -226,16 +266,22 @@ def _process_lead(self, db, lead_id, icp_prompt):
         _save_validation(
             db, lead_id, stage="contact", result=contact_result,
             score=_num(getattr(contact_result, "contact_quality_score", 0)),
-            passed=bool(getattr(contact_result, "email_valid", False)
-                        or getattr(contact_result, "phone_valid", False)))
+            passed=contact_result.contact_available)
         db.commit()
 
         # ── Stage 1: ICP Validation ───────────────────────────────────────
         log.info("Stage 1: ICP validation")
         t0 = datetime.now(timezone.utc)
-        icp_result = validate_icp(lead_data, icp_prompt,
-                       job_id=lead.job_id, lead_id=lead_id,
-                       evidence=web_result.evidence, contact_result=contact_result)
+        icp_result = None
+        if resuming_saved_contact:
+            saved_icp = db.query(ValidationResult).filter_by(lead_id=lead_id, stage="icp").first()
+            icp_result = _restore_stage_result(saved_icp, ICPResult, "icp")
+        db.commit()
+        if icp_result is None:
+            icp_result = validate_icp(lead_data, icp_prompt,
+                           job_id=lead.job_id, lead_id=lead_id,
+                           evidence=web_result.evidence, contact_result=contact_result)
+        _require_stage_result(icp_result, "icp")
         clog.stage("STAGE 1: ICP VALIDATION", icp_result,
                    source=validate_icp, inputs=lead_data, started=t0)
         log.info("  ↳ Stage 1 output: " + _summarise(
@@ -260,20 +306,24 @@ def _process_lead(self, db, lead_id, icp_prompt):
         lead_data["Company Description"] = lead.company_description or ""
         lead_data["Technologies Used"]   = lead.technologies_used or ""
 
+        db.commit()
         t0 = datetime.now(timezone.utc)
         score_result = score_lead(lead_data, icp_result, web_result,
                                   contact_result,
-                                  job_id=lead.job_id, lead_id=lead_id)
+                                  job_id=lead.job_id, lead_id=lead_id, icp_prompt=icp_prompt)
+        _require_stage_result(score_result, "score")
         clog.stage("SCORING", score_result, source=score_lead, started=t0)
 
         fs = FinalScore(
             lead_id=         lead_id,
             total_score=     _num(getattr(score_result, "total_score", 0)),
             icp_score=       _num(getattr(score_result, "icp_score", 0)),
-            authority_score= _num(getattr(score_result, "authority_score", 0)),
-            data_score=      _num(getattr(score_result, "data_score", 0)),
+            authority_score=None, data_score=None,  # Inactive legacy storage only.
             growth_score=    _num(getattr(score_result, "growth_score", 0)),
             contact_score=   _num(getattr(score_result, "contact_score", 0)),
+            scoring_version=score_result.scoring_version,
+            qualification_status=score_result.qualification_status,
+            scoring_details_json=score_result.scoring_details_json,
             priority=        getattr(score_result, "priority", "Low") or "Low",
             reasoning=       getattr(score_result, "reasoning", "") or "",
             growth_signals=  getattr(score_result, "growth_signals", "") or "",
@@ -284,8 +334,7 @@ def _process_lead(self, db, lead_id, icp_prompt):
 
         log.info(
             "  ↳ Score breakdown: "
-            f"icp={fs.icp_score} authority={fs.authority_score} "
-            f"data={fs.data_score} growth={fs.growth_score} "
+            f"icp={fs.icp_score} growth={fs.growth_score} "
             f"contact={fs.contact_score}")
         log.info(
             f"Done: score={fs.total_score} priority={fs.priority} — "
@@ -361,7 +410,7 @@ def finalise_job(self, results: list, job_id: str):
         # If literally nothing was processed, mark failed rather than pretend OK.
         job.status = "completed" if processed > failed else "failed"
         job.completed_at = datetime.now(timezone.utc)
-        db.flush()
+        db.commit()
 
         log.info(f"Job finalised ({job.status}): {processed}/{total} leads processed")
 

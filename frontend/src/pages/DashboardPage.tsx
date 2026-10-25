@@ -11,7 +11,8 @@ import { Button } from '@/components/ui/Button';
 import { Badge, StatusBadge } from '@/components/ui/Badge';
 import { CardSkeleton, TableSkeleton } from '@/components/ui/Skeleton';
 import { useDashboardStats } from '@/hooks/useDashboardStats';
-import { getJobs, deleteJob, downloadExport } from '@/api/endpoints';
+import { getJobs, deleteJob } from '@/api/endpoints';
+import { useExports } from '@/components/ExportManager';
 import { useToast } from '@/components/ui/Toast';
 import { fmtDate, numVal, safeArr } from '@/lib/format';
 import type { JobSummary } from '@/types';
@@ -25,6 +26,7 @@ export function DashboardPage() {
   const { stats, isLoading } = useDashboardStats();
   const { toast } = useToast();
   const qc = useQueryClient();
+  const exports = useExports();
 
   const { data: jobs = [], isLoading: jobsLoading } = useQuery({
     queryKey: ['jobs'],
@@ -48,14 +50,9 @@ export function DashboardPage() {
     }
   };
 
-  const handleExport = async (jobId: string, format: 'excel' | 'csv', e: React.MouseEvent) => {
+  const handleExport = (jobId: string, format: 'excel' | 'csv', e: React.MouseEvent) => {
     e.stopPropagation();
-    try {
-      await downloadExport(jobId, format);
-      toast(`${format === 'excel' ? 'Excel' : 'CSV'} export downloaded`, 'success');
-    } catch {
-      toast(`Export failed`, 'error');
-    }
+    exports.start(jobId, format);
   };
 
   const kpis = [
@@ -126,7 +123,7 @@ export function DashboardPage() {
               action={<Link to="/upload"><Button icon={<Upload className="h-4 w-4" />}>Upload File</Button></Link>}
             />
           ) : (
-            <JobsTable jobs={jobs} onDelete={handleDelete} onExport={handleExport} />
+            <JobsTable jobs={jobs} onDelete={handleDelete} onExport={handleExport} isExporting={exports.isBusy} />
           )}
         </Card>
       </main>
@@ -134,10 +131,11 @@ export function DashboardPage() {
   );
 }
 
-function JobsTable({ jobs, onDelete, onExport }: {
+function JobsTable({ jobs, onDelete, onExport, isExporting }: {
   jobs: JobSummary[];
   onDelete: (id: string, e: React.MouseEvent) => void;
   onExport: (id: string, fmt: 'excel' | 'csv', e: React.MouseEvent) => void;
+  isExporting: (id: string, fmt: 'excel' | 'csv') => boolean;
   
 }) {
   const navigate = useNavigate();
@@ -190,11 +188,11 @@ function JobsTable({ jobs, onDelete, onExport }: {
                     <Link to={`/jobs/${job.job_id}`} onClick={(e) => e.stopPropagation()}>
                       <Button size="sm" variant="ghost" icon={<Eye className="h-3.5 w-3.5" />}>View</Button>
                     </Link>
-                    <button disabled={job.status !== 'completed'} onClick={(e) => onExport(job.job_id, 'excel', e)} title="Export Excel" className="rounded-lg p-2 text-emerald-600 hover:bg-emerald-50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
-                      <FileSpreadsheet className="h-4 w-4" />
+                    <button disabled={job.status !== 'completed' || isExporting(job.job_id, 'excel')} onClick={(e) => onExport(job.job_id, 'excel', e)} title="Export all rows to Excel" aria-label="Export all rows to Excel" className="rounded-lg p-2 text-emerald-600 hover:bg-emerald-50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
+                      {isExporting(job.job_id, 'excel') ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSpreadsheet className="h-4 w-4" />}
                     </button>
-                    <button disabled={job.status !== 'completed'} onClick={(e) => onExport(job.job_id, 'csv', e)} title="Export CSV" className="rounded-lg p-2 text-sky-600 hover:bg-sky-50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
-                      <FileText className="h-4 w-4" />
+                    <button disabled={job.status !== 'completed' || isExporting(job.job_id, 'csv')} onClick={(e) => onExport(job.job_id, 'csv', e)} title="Export all rows to CSV" aria-label="Export all rows to CSV" className="rounded-lg p-2 text-sky-600 hover:bg-sky-50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
+                      {isExporting(job.job_id, 'csv') ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
                     </button>
                     <button onClick={(e) => onDelete(job.job_id, e)} title="Delete" className="rounded-lg p-2 text-rose-500 hover:bg-rose-50 transition-colors">
                       <Trash2 className="h-4 w-4" />

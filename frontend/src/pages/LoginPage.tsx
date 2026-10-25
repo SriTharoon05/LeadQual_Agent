@@ -1,9 +1,10 @@
 import { motion } from 'framer-motion';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { isAxiosError } from 'axios';
 import { useNavigate } from 'react-router-dom';
 import { Sparkles, Lock, User, ArrowRight, AlertCircle } from 'lucide-react';
 import { login } from '@/api/endpoints';
-import { setAuth } from '@/lib/auth';
+import { getToken, setAuth } from '@/lib/auth';
 import { Button } from '@/components/ui/Button';
 import { Input, Label } from '@/components/ui/Input';
 
@@ -13,19 +14,40 @@ export function LoginPage() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const submitting = useRef(false);
+  const mounted = useRef(true);
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; request.current?.abort(); };
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submitting.current) return;
+    submitting.current = true;
+    const controller = new AbortController();
+    request.current = controller;
+    const previousToken = getToken();
     setError(null);
     setLoading(true);
     try {
-      const res = await login(username, password);
+      const res = await login(username.trim(), password, controller.signal);
+      if (!mounted.current || controller.signal.aborted) return;
+      if (getToken() !== previousToken) {
+        setError('The signed-in account changed in another tab. Reload this page before signing in.');
+        return;
+      }
       setAuth(res.token, res.username);
-      navigate('/dashboard');
-    } catch {
-      setError('Invalid username or password');
+      navigate('/dashboard', { replace: true });
+    } catch (cause) {
+      if (!mounted.current || controller.signal.aborted) return;
+      setError(isAxiosError(cause) && cause.response?.status === 401
+        ? 'Invalid username or password'
+        : 'Sign-in is temporarily unavailable. Check your connection and try again.');
     } finally {
-      setLoading(false);
+      submitting.current = false;
+      if (mounted.current) setLoading(false);
     }
   };
 
@@ -64,6 +86,7 @@ export function LoginPage() {
                   placeholder="Enter username"
                   className="pl-10"
                   autoFocus
+                  autoComplete="username"
                   required
                 />
               </div>
@@ -76,6 +99,7 @@ export function LoginPage() {
                 <Input
                   id="password"
                   type="password"
+                  autoComplete="current-password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="Enter password"
