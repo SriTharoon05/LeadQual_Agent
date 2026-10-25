@@ -127,8 +127,20 @@ def migrate():
         for table in (ChatConversation.__table__, ChatMessage.__table__):
             for index in table.indexes:
                 index.create(connection, checkfirst=True)
-        next(index for index in Lead.__table__.indexes if index.name == "ix_leads_job_row").create(
-            connection, checkfirst=True)
+        lead_index = next(
+            index for index in Lead.__table__.indexes
+            if index.name == "ix_leads_job_row"
+        )
+
+        existing = connection.execute(text("""
+            SELECT 1
+            FROM sys.indexes
+            WHERE object_id = OBJECT_ID('leads')
+            AND LOWER(name) = LOWER(:name)
+        """), {"name": lead_index.name}).first()
+
+        if existing is None:
+            lead_index.create(connection)
     print("Chat migration complete. Deploy the updated API and frontend together.")
 
 
