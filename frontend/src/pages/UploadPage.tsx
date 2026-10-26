@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -7,13 +7,14 @@ import {
   Loader2, ArrowRight, FileUp, Target, Zap,
 } from 'lucide-react';
 import { TopBar } from '@/components/TopBar';
+import { ProcessingModeChoice } from '@/components/ProcessingModeChoice';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Textarea, Label } from '@/components/ui/Input';
 import { useToast } from '@/components/ui/Toast';
 import { uploadFile, startIcp, getJobStatus } from '@/api/endpoints';
 import { ALLOWED_EXT, isValidFile, fmtBytes } from '@/lib/format';
-import type { JobStatus } from '@/types';
+import type { JobStatus, ProcessingMode } from '@/types';
 import { newRequestId } from '@/lib/leadCache';
 import { isAxiosError } from 'axios';
 
@@ -30,28 +31,38 @@ const STAGES = [
   { label: 'Completed',                         threshold: 100 },
 ];
 
-function uploadRequestId(file: File): string {
+function uploadRequestId(file: File, forceNew = false): { id: string; recovered: boolean } {
   const key = `lead-upload:request:${localStorage.getItem('username') ?? ''}`;
   const identity = JSON.stringify([file.name, file.size, file.lastModified]);
   try {
     const saved = JSON.parse(sessionStorage.getItem(key) || 'null');
-    if (saved?.identity === identity && typeof saved.id === 'string'
-        && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(saved.id)) return saved.id;
+    if (!forceNew && saved?.identity === identity && typeof saved.id === 'string'
+        && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(saved.id)) return { id: saved.id, recovered: true };
   } catch { /* Use a fresh ID if draft metadata was unavailable/corrupt. */ }
   const id = newRequestId();
   try { sessionStorage.setItem(key, JSON.stringify({ identity, id })); } catch { /* Ref retains retries. */ }
-  return id;
+  return { id, recovered: false };
+}
+
+function forgetUploadRequest(jobId: string) {
+  try {
+    const key = `lead-upload:request:${localStorage.getItem('username') ?? ''}`;
+    if (JSON.parse(sessionStorage.getItem(key) || 'null')?.id === jobId) sessionStorage.removeItem(key);
+  } catch { /* A disabled store cannot prevent processing. */ }
 }
 
 export function UploadPage() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const prefill = location.state as { icpPrompt?: unknown; processingMode?: unknown } | null;
   const { toast } = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [step, setStep] = useState<Step>('select');
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [icpPrompt, setIcpPrompt] = useState('');
+  const [icpPrompt, setIcpPrompt] = useState(typeof prefill?.icpPrompt === 'string' ? prefill.icpPrompt.slice(0, 8000) : '');
+  const [processingMode, setProcessingMode] = useState<ProcessingMode>(prefill?.processingMode === 'fresh' ? 'fresh' : 'reuse');
   const [jobId, setJobId] = useState<string | null>(null);
   // Import counts now arrive from polling (not from the instant upload response).
   const [importStats, setImportStats] = useState<{ total_rows: number; duplicates_removed: number } | null>(null);
@@ -78,15 +89,35 @@ export function UploadPage() {
     if (!file || uploadBusy.current) return;
     uploadBusy.current = true;
     const previousUpload = uploadRequest.current;
-    const requestId = previousUpload && previousUpload.file === file ? previousUpload.id : uploadRequestId(file);
+    const candidate = previousUpload && previousUpload.file === file ? { id: previousUpload.id, recovered: false } : uploadRequestId(file);
+    let requestId = candidate.id;
+    let uploadStarted = false;
     uploadRequest.current = { file, id: requestId };
     setStep('uploading');
     try {
+      if (candidate.recovered) {
+        try {
+          const existing = await getJobStatus(requestId);
+          if (['running', 'completed', 'failed', 'import_failed'].includes(existing.status)) {
+            requestId = uploadRequestId(file, true).id;
+            uploadRequest.current = { file, id: requestId };
+          }
+        } catch (cause) {
+          if (!isAxiosError(cause) || cause.response?.status !== 404) throw cause;
+        }
+      }
+      uploadStarted = true;
       const res = await uploadFile(file, requestId);
       setJobId(res.job_id);
       // Upload returns instantly with status "importing" — poll import status next.
       setStep('importing');
     } catch (cause) {
+      if (!uploadStarted) {
+        uploadRequest.current = null;
+        toast('Could not check the earlier upload. Retry when the connection recovers; no new upload was sent.', 'error');
+        setStep('select');
+        return;
+      }
       try {
         const current = await getJobStatus(requestId);
         if (!current.upload_pending && current.status !== 'import_failed') {
@@ -106,12 +137,15 @@ export function UploadPage() {
     icpBusy.current = true;
     setStep('processing');
     try {
-      await startIcp(jobId, icpPrompt.trim());
+      await startIcp(jobId, icpPrompt.trim(), processingMode);
+      forgetUploadRequest(jobId);
       toast('Processing started', 'success');
     } catch {
       try {
         const current = await getJobStatus(jobId);
-        if (['running', 'completed', 'failed'].includes(current.status)) {
+        if (['running', 'completed', 'failed'].includes(current.status)
+            && current.icp_prompt === icpPrompt.trim() && (current.processing_mode ?? 'reuse') === processingMode) {
+          forgetUploadRequest(jobId);
           toast('The processing request was accepted. Loading its current status.', 'info');
           return;
         }
@@ -128,6 +162,7 @@ export function UploadPage() {
         <div className="mb-8">
           <h1 className="text-2xl font-bold text-slate-800">Upload & Qualify Leads</h1>
           <p className="text-sm text-slate-500 mt-1">Upload a lead file, define your ICP, and let AI qualify them</p>
+          {prefill?.processingMode === 'fresh' && <p className="mt-3 rounded-xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-900">Upload the original file again to create a new run. Your ICP is prefilled and Fresh AI research is selected; you can switch to reuse before starting. Previous results stay available.</p>}
         </div>
 
         {/* Stepper indicator */}
@@ -258,6 +293,7 @@ export function UploadPage() {
                   <p className="text-xs text-slate-400 mt-1.5">The more specific your ICP, the better the qualification accuracy.</p>
                 </div>
 
+                <ProcessingModeChoice value={processingMode} onChange={setProcessingMode} disabled={icpBusy.current} />
                 <div className="flex justify-between">
                   <Button variant="ghost" onClick={() => setStep('select')}>Back</Button>
                   <Button onClick={handleIcp} disabled={!icpPrompt.trim()} icon={<Zap className="h-4 w-4" />}>

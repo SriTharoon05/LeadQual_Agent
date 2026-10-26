@@ -13,6 +13,7 @@ export interface HealthResponse {
 
 // ── Jobs ────────────────────────────────────────────────────────────────────
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'importing' | 'import_failed';
+export type ProcessingMode = 'reuse' | 'fresh';
 export type Priority  = 'High' | 'Medium' | 'Low';
 
 export interface UploadResponse {
@@ -31,6 +32,7 @@ export interface IcpResponse {
 }
 
 export interface JobStatusResponse {
+  processing_mode?: ProcessingMode;
   reused_rows: number;
   research_reused_rows: number;
   icp_prompt?: string | null;

@@ -9,6 +9,7 @@ import {
   ChevronsLeft, ChevronsRight, Building2, Mail, Loader2, Target, Zap,
 } from 'lucide-react';
 import { TopBar } from '@/components/TopBar';
+import { ProcessingModeChoice } from '@/components/ProcessingModeChoice';
 import { LeadTracking } from '@/components/LeadTracking';
 import { EvidenceBadge } from '@/components/LeadEvidenceRefresh';
 import { invalidateLeadData, mergeLeadSnapshot } from '@/lib/leadCache';
@@ -22,7 +23,7 @@ import { useToast } from '@/components/ui/Toast';
 import { getJobStatus, getResultsPage, deleteJob, startIcp, getLeadDetail } from '@/api/endpoints';
 import { useExports } from '@/components/ExportManager';
 import { dash, fmtDate, safeArr } from '@/lib/format';
-import type { LeadResult, Priority } from '@/types';
+import type { LeadResult, Priority, ProcessingMode } from '@/types';
 
 const LeadDetailDrawer = lazy(() => import('@/components/LeadDetailDrawer').then((module) => ({ default: module.LeadDetailDrawer })));
 const ChatWidget = lazy(() => import('@/components/ChatWidget').then((module) => ({ default: module.ChatWidget })));
@@ -54,6 +55,7 @@ function JobDetailContent({ jobId }: { jobId: string }) {
   const [selectedLead, setSelectedLead] = useState<LeadResult | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [resumeIcp, setResumeIcp] = useState('');
+  const [processingMode, setProcessingMode] = useState<ProcessingMode>('reuse');
   const [starting, setStarting] = useState(false);
   const startingRef = useRef(false);
   const opening = useRef(0);
@@ -172,14 +174,15 @@ function JobDetailContent({ jobId }: { jobId: string }) {
     startingRef.current = true;
     setStarting(true);
     try {
-      await startIcp(jobId, resumeIcp.trim());
+      await startIcp(jobId, resumeIcp.trim(), processingMode);
       toast('Processing started; you can safely return to the dashboard', 'success');
       await qc.invalidateQueries({ queryKey: ['job-status', jobId] });
       await qc.invalidateQueries({ queryKey: ['jobs'] });
     } catch {
       try {
         const current = await getJobStatus(jobId);
-        if (['running', 'completed', 'failed'].includes(current.status)) {
+        if (['running', 'completed', 'failed'].includes(current.status)
+            && current.icp_prompt === resumeIcp.trim() && (current.processing_mode ?? 'reuse') === processingMode) {
           qc.setQueryData(['job-status', jobId], current);
           toast('Processing was accepted. The current status is now loaded.', 'info');
           return;
@@ -222,13 +225,15 @@ function JobDetailContent({ jobId }: { jobId: string }) {
                 <span>Completed: {fmtDate(status?.completed_at)}</span>
                 <span>Rows: {status?.total_rows ?? '—'}</span>
                 <span>Processed: {status?.processed_rows ?? '—'}</span>
+                {!isAwaitingIcp && <span>Research mode: {status?.processing_mode === 'fresh' ? 'Fresh AI research' : 'Reuse saved research'}</span>}
                 {(status?.failed_rows ?? 0) > 0 && <span className="text-rose-600">Failed: {status?.failed_rows}</span>}
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              {(isCompleted || status?.status === 'failed') && <Button size="sm" variant="outline" icon={<Zap className="h-3.5 w-3.5" />} onClick={() => navigate('/upload', { state: { icpPrompt: status?.icp_prompt || '', processingMode: 'fresh' } })}>New run</Button>}
               <Button size="sm" variant="outline" icon={<RefreshCw className="h-3.5 w-3.5" />}
                 onClick={handleRefresh}>
-                Refresh
+                Reload results
               </Button>
               <Button size="sm" variant="ghost" icon={exports.isBusy(jobId, 'excel') ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSpreadsheet className="h-4 w-4 text-emerald-600" />}
                 onClick={() => exports.start(jobId, 'excel')} disabled={!isCompleted || exports.isBusy(jobId, 'excel')}>
@@ -277,6 +282,7 @@ function JobDetailContent({ jobId }: { jobId: string }) {
               onChange={(event) => setResumeIcp(event.target.value)}
               placeholder="B2B companies in the target industry, geography, employee and revenue range…"
             />
+            <div className="mt-4"><ProcessingModeChoice value={processingMode} onChange={setProcessingMode} disabled={starting} /></div>
             <div className="mt-4 flex justify-end">
               <Button onClick={handleStartIcp} disabled={!resumeIcp.trim() || starting} icon={starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}>
                 {starting ? 'Starting…' : 'Start Background Processing'}

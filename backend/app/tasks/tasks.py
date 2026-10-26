@@ -185,7 +185,14 @@ def _process_lead(self, db, lead_id, icp_prompt):
     if lead.final_score:
         _mark_lead_finished(db, lead, failed=False)
         return
-    source, reuse_kind = reusable_lead(db, lead, icp_prompt)
+    # Read durable policy instead of trusting an old Celery delivery's defaults.
+    mode = db.query(Job.processing_mode).filter(Job.id == lead.job_id).scalar()
+    if mode not in ("reuse", "fresh"):
+        raise RuntimeError("Job has no valid saved processing mode")
+    fresh = mode == "fresh"
+    if fresh:
+        lead.reused_from_lead_id = lead.reuse_kind = None
+    source, reuse_kind = (None, None) if fresh else reusable_lead(db, lead, icp_prompt)
     if (source and reuse_kind == "full" and lead.evidence_checked_at is not None
             and (source.evidence_checked_at is None or source.evidence_checked_at < lead.evidence_checked_at)):
         source, reuse_kind = None, None  # Resume this attempt's newer saved research.
@@ -233,8 +240,10 @@ def _process_lead(self, db, lead_id, icp_prompt):
         # Release all read/write transactions before Redis, DNS or AI calls.
         # The session-owned identity lock remains held across these commits.
         db.commit()
-        if cached_web is None:
+        if cached_web is None and not fresh:
             cached_web = _get_cached_web(cache_key)
+            if cached_web is not None:
+                lead.reuse_kind = "research"
 
         if cached_web:
             web_result = cached_web

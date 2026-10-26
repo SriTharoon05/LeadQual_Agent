@@ -11,7 +11,7 @@ import type {
   ChatMessage,
   ChatRequest,
   DashboardStatsResponse,
-  RefreshRun, TrackingUpdate,
+  RefreshRun, TrackingUpdate, ProcessingMode,
 } from '@/types';
 
 // ── Auth ────────────────────────────────────────────────────────────────────
@@ -39,8 +39,8 @@ export const uploadFile = async (file: File, requestId?: string): Promise<Upload
 };
 
 
-export const startIcp = async (jobId: string, icpPrompt: string): Promise<IcpResponse> => {
-  const { data } = await apiClient.post<IcpResponse>(`/jobs/${jobId}/icp`, { icp_prompt: icpPrompt });
+export const startIcp = async (jobId: string, icpPrompt: string, processingMode: ProcessingMode = 'reuse'): Promise<IcpResponse> => {
+  const { data } = await apiClient.post<IcpResponse>(`/jobs/${jobId}/icp`, { icp_prompt: icpPrompt, processing_mode: processingMode });
   return data;
 };
 

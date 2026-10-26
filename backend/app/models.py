@@ -29,7 +29,10 @@ def _new_uuid() -> str:
 # ── jobs ──────────────────────────────────────────────────────────────────────
 class Job(Base):
     __tablename__ = "jobs"
-    __table_args__ = (Index("ix_jobs_dispatch_recovery", "status", "dispatch_complete", "dispatch_updated_at"),)
+    __table_args__ = (
+        Index("ix_jobs_dispatch_recovery", "status", "dispatch_complete", "dispatch_updated_at"),
+        CheckConstraint("processing_mode IN ('reuse','fresh')", name="ck_jobs_processing_mode"),
+    )
 
     id: Mapped[str] = mapped_column(
         UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
@@ -44,6 +47,7 @@ class Job(Base):
     research_reused_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     icp_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    processing_mode: Mapped[str] = mapped_column(String(10), nullable=False, default="reuse", server_default=text("'reuse'"))
     file_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     file_type: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     duplicates_removed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

@@ -1,5 +1,8 @@
 # Quality Lead API and workers
 
+For per-upload **Reuse saved research / Fresh AI research** options and the
+required schema upgrade, see [the processing modes guide](RELEASE_PROCESSING_MODES.md).
+
 For the current SQL-backed concurrency slider, live warning/error feeds,
 job/lead/stage costs in USD/INR and the required migration, see
 [the admin operations rollout guide](RELEASE_ADMIN_OPERATIONS.md). This release

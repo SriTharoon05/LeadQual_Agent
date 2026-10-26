@@ -137,10 +137,13 @@ def flush_operations_telemetry():
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
 class ICPRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     icp_prompt: str = Field(min_length=1, max_length=8000)
+    processing_mode: Literal["reuse", "fresh"] = "reuse"
 
 
 class JobStatusResponse(BaseModel):
+    processing_mode: Literal["reuse", "fresh"] = "reuse"
     job_id:         str
     status:         str
     file_name:      Optional[str] = None      # (fixed: no trailing comma → not a tuple)
@@ -346,7 +349,8 @@ def submit_icp(
     transaction_lock(db, "ql:dispatch:" + job_id)
     job: Job = _get_job_or_404(job_id, db)
 
-    if job.status == "running" and job.icp_prompt == body.icp_prompt.strip():
+    if (job.status == "running" and job.icp_prompt == body.icp_prompt.strip()
+            and job.processing_mode == body.processing_mode):
         # Recover an accepted submission after a browser timeout; a different
         # prompt remains forbidden while any published work can still run.
         db.commit()
@@ -359,7 +363,7 @@ def submit_icp(
     if job.status not in ("queued",):
         raise HTTPException(
             status_code=409,
-            detail=f"Job is already '{job.status}'. Only 'queued' jobs can be started.",
+            detail=f"Job is already '{job.status}'. The ICP and research mode cannot change after processing starts. Start a new upload for another run.",
         )
 
     if not body.icp_prompt.strip():
@@ -367,6 +371,7 @@ def submit_icp(
 
     # Save ICP prompt and mark running
     job.icp_prompt = body.icp_prompt.strip()
+    job.processing_mode = body.processing_mode
     job.status     = "running"
     db.flush()
 
@@ -762,6 +767,7 @@ def _job_to_status(job: Job) -> JobStatusResponse:
         reused_rows=job.reused_rows or 0,
         research_reused_rows=job.research_reused_rows or 0,
         icp_prompt=job.icp_prompt,
+        processing_mode=job.processing_mode,
         progress_pct=       job.progress_pct,
         duplicates_removed= getattr(job, "duplicates_removed", None),
         import_error=       getattr(job, "import_error", None),

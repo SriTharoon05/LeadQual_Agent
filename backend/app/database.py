@@ -283,7 +283,7 @@ def schema_ready() -> bool:
                 SELECT TOP 0 l.tracking_id, l.crm_key, l.email_key, l.linkedin_key,
                     l.person_company_key, l.input_fingerprint, l.research_fingerprint,
                     l.reused_from_lead_id, l.reuse_kind, t.reviewed, t.notes, t.version,
-                    j.reused_rows, j.research_reused_rows, l.evidence_checked_at,
+                    j.reused_rows, j.research_reused_rows, j.processing_mode, l.evidence_checked_at,
                     j.source_blob_name, j.upload_fingerprint, j.dispatch_row_index, j.dispatch_lead_id,
                     j.dispatch_complete, j.dispatch_updated_at, j.dispatch_epoch,
                     t.owner_id, t.follow_up_at, t.follow_up_note, t.follow_up_completed_at
@@ -344,5 +344,5 @@ def schema_ready() -> bool:
                 return False
         return True
     except Exception:
-        logger.warning("Schema is not ready; apply the lead reuse, chat reliability, team workflow and scoring v2 migrations")
+        logger.warning("Schema is not ready; apply the documented lead reuse, chat, refresh, scoring, performance, admin operations and processing modes migrations")
         return False
