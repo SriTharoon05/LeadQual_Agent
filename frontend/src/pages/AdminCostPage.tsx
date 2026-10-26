@@ -6,7 +6,7 @@ import { getCostJobs, getJobCost, getLeadCost } from '@/api/admin';
 import { AdminError, AdminLayout, costMoney, metric } from '@/components/AdminLayout';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
-import { eventTime } from '@/components/LiveIssuePanel';
+import { eventTime } from '@/components/AdminEvents';
 import { useDebouncedValue } from '@/hooks/useDebouncedValue';
 import type { CostMetrics, Pricing, StageCost } from '@/types/admin';
 

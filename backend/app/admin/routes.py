@@ -358,7 +358,7 @@ def admin_logs(job_id: UUID | None = None, severity: str | None = Query(None, pa
         raise
 
 
-@router.get("/jobs/{job_id}/events")
+@router.get("/admin/jobs/{job_id}/events")
 def job_events(job_id: UUID, limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_db)):
     try:
         job = _job(db, job_id)

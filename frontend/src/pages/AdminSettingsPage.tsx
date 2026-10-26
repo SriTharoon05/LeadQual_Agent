@@ -7,7 +7,7 @@ import { AdminError, AdminLayout } from '@/components/AdminLayout';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { useToast } from '@/components/ui/Toast';
-import { eventTime } from '@/components/LiveIssuePanel';
+import { eventTime } from '@/components/AdminEvents';
 import type { AdminSettings, SettingsSave } from '@/types/admin';
 
 const RATE_FIELDS = [

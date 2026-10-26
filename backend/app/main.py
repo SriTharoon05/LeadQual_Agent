@@ -658,7 +658,7 @@ def _cleanup_deleted_job_artifacts(job_id: str):
         logger.warning("Vector cleanup failed for deleted job %s", job_id)
     _delete_job_blobs(job_id)
 
-@app.get("/jobs/{job_id}/token-report")
+@app.get("/admin/jobs/{job_id}/token-report")
 def token_report(job_id: str, db: Session = Depends(get_db)):
     """Per-stage token consumption breakdown for a job."""
     from sqlalchemy import func as sqlfunc

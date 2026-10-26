@@ -1,4 +1,3 @@
-import { LiveIssuePanel } from '@/components/LiveIssuePanel';
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -331,7 +330,6 @@ useEffect(() => {
       <Loader2 className="h-10 w-10 text-brand-500 animate-spin mb-4" />
       <p className="text-sm font-medium text-slate-700">Extracting columns &amp; inserting rows…</p>
       <p className="text-xs text-slate-400 mt-1">Analyzing your file — this can take a moment for large files.</p>
-      <LiveIssuePanel jobId={jobId} />
       {isError && <p role="alert" className="mt-4 text-sm text-rose-700">Could not check import progress. Your upload may still be importing. <button className="underline" onClick={() => void refetch()}>Retry status</button></p>}
     </Card>
   );
@@ -370,7 +368,6 @@ function ProcessingView({ jobId, onComplete, onDashboard }: {
       <Card className="p-12 flex flex-col items-center">
         <Loader2 className="h-10 w-10 text-brand-500 animate-spin mb-4" />
         <p className="text-sm font-medium text-slate-700">Connecting to processing pipeline…</p>
-        <LiveIssuePanel jobId={jobId} />
         {isError && <p role="alert" className="mt-3 text-sm text-rose-700">Could not load progress. <button className="underline" onClick={() => void refetch()}>Retry</button></p>}
       </Card>
     );
@@ -378,7 +375,6 @@ function ProcessingView({ jobId, onComplete, onDashboard }: {
 
   return (
     <Card className="p-8">
-      <LiveIssuePanel jobId={jobId} />
       {isError && <p role="alert" className="mb-4 text-sm text-rose-700">Progress could not be refreshed; the last saved status is shown. <button className="underline" onClick={() => void refetch()}>Retry status</button></p>}
       <div className="flex items-center gap-3 mb-6">
         {jobStatus === 'failed' ? (

@@ -1,4 +1,3 @@
-import { LiveIssuePanel } from '@/components/LiveIssuePanel';
 import { lazy, Suspense, useState, useEffect, useRef } from 'react';
 import { useDebouncedValue } from '@/hooks/useDebouncedValue';
 import { useParams, Link, useNavigate } from 'react-router-dom';
@@ -202,8 +201,6 @@ function JobDetailContent({ jobId }: { jobId: string }) {
     <div className="min-h-screen bg-sky-gradient">
       <TopBar />
       <main className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 space-y-6">
-        <LiveIssuePanel jobId={jobId} />
-        <Link to={`/admin/cost/${jobId}`} className="inline-block text-sm font-medium text-brand-700 hover:underline">View job costs →</Link>
 
         {/* Back link */}
         <Link to="/dashboard" className="inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-brand-600 transition-colors">

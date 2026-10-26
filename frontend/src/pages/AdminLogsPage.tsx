@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { getOperationalEvents } from '@/api/admin';
 import { AdminError, AdminLayout } from '@/components/AdminLayout';
-import { EventList } from '@/components/LiveIssuePanel';
+import { EventList } from '@/components/AdminEvents';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { useDebouncedValue } from '@/hooks/useDebouncedValue';

@@ -1,7 +1,9 @@
 # Admin operations rollout
 
 This release adds `/admin/settings`, `/admin/cost` and `/admin/logs` to the
-authenticated application. All existing application login accounts come from
+authenticated application. Open those URLs manually after the normal app login;
+they have no links in the main navigation, dashboard, upload or lead screens.
+There is no separate admin password or public access. All existing application login accounts come from
 `admin_users`; these pages use the same verified authentication. Removed team
 profiles were assignment records and never granted login access.
 
@@ -79,14 +81,18 @@ calls and commits; work retries. Storage/coordination failures pause new starts.
 More active leads can exhaust Azure request/token quotas, increase SQL load and
 spend budget faster. HTTP 429 honors provider retry hints and applies a shared
 cooldown to qualification starts. Throttling does not mark a lead as bad evidence.
-The UI shows cooldown and recent warning/error events every three seconds while
-visible. `/admin/logs` provides job/severity/rate-limit filters and cursor-paged
+Operational warnings, errors, cooldowns and cost details appear only on the admin
+pages. Main upload/lead screens do not poll or display operational diagnostics.
+`/admin/logs` refreshes every three seconds while visible and provides
+job/severity/rate-limit filters and cursor-paged
 history. INFO output stays in server logs and is not written to SQL. Root Python
 warnings/errors are captured with available job/lead/stage context, sanitized
 and persisted asynchronously. Process-kill, container, Nginx and infrastructure
 logs remain the hosting platform's responsibility. During a SQL outage the UI
 can show recent Redis-buffered events; the complete SQL history returns after
-recovery. Local warning queues are bounded and attempt a bounded clean-exit flush.
+recovery. Per-job events and the legacy token breakdown are available at
+`/admin/jobs/{job_id}/events` and `/admin/jobs/{job_id}/token-report`, with the same
+normal login requirement. Local warning queues are bounded and attempt a bounded clean-exit flush.
 
 ## Cost accounting
 

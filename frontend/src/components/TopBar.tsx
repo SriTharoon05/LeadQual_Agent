@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useLocation } from 'react-router-dom';
-import { Sparkles, LogOut, Activity, LayoutDashboard, Upload, Settings, DollarSign, AlertTriangle } from 'lucide-react';
+import { Sparkles, LogOut, Activity, LayoutDashboard, Upload } from 'lucide-react';
 import { getHealth } from '@/api/endpoints';
 import { clearAuth, getUser } from '@/lib/auth';
 import { useToast } from '@/components/ui/Toast';
@@ -29,7 +29,7 @@ export function TopBar() {
   };
 
   const navLink = (to: string, label: string, icon: React.ReactNode) => {
-    const active = location.pathname === to || (to === '/dashboard' && location.pathname.startsWith('/jobs')) || (to === '/admin/cost' && location.pathname.startsWith('/admin/cost/'));
+    const active = location.pathname === to || (to === '/dashboard' && location.pathname.startsWith('/jobs'));
     return (
       <Link
         to={to}
@@ -58,9 +58,6 @@ export function TopBar() {
           <nav className="flex items-center gap-1">
             {navLink('/dashboard', 'Dashboard', <LayoutDashboard className="h-4 w-4" />)}
             {navLink('/upload', 'Upload', <Upload className="h-4 w-4" />)}
-            {navLink('/admin/settings', 'Settings', <Settings className="h-4 w-4" />)}
-            {navLink('/admin/cost', 'Costs', <DollarSign className="h-4 w-4" />)}
-            {navLink('/admin/logs', 'Warnings', <AlertTriangle className="h-4 w-4" />)}
           </nav>
         </div>
 
