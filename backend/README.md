@@ -31,6 +31,21 @@ uvicorn app.main:app --reload --port 8000
 celery -A app.celery_app.celery worker --loglevel=info -Q lead_processing,lead_imports,lead_embeddings --pool=solo
 ```
 
+Include `lead_exports` in the worker queue list when testing background exports.
+Install all backend dependencies with `python -m pip install -r requirements.txt`;
+export workers require XlsxWriter even when no export has been requested yet.
+
+If Vite starts on port 5174, add its exact origin to `CORS_ORIGINS` in your existing
+backend `.env`, then restart Uvicorn. For example:
+`CORS_ORIGINS=http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174`.
+Existing `.env` values override defaults and are not changed by pulling code.
+
+Azure SQL error 40615 means the server firewall denied the client's public IP.
+In Azure Portal, open the SQL server's Networking settings and allow the exact
+client IP reported in the error (start and end IP equal), or use your organization's
+approved private-network connection. Wait up to five minutes and retry. API database
+connection failures return HTTP 503; a code update does not grant firewall access.
+
 See `../dev.md` for local setup, `../read.md` for the end-to-end design, and `../AZURE_DEPLOYMENT.md` for production deployment.
 
 docker local run commands

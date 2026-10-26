@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     MAX_ROWS_PER_UPLOAD: int = 100000
 
     # Comma-separated browser origins. Never use "*" together with credentials.
-    CORS_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
+    CORS_ORIGINS: str = "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174,http://localhost:3000"
     TRUSTED_HOSTS: str = "localhost,127.0.0.1"
     AUTH_SECRET_KEY: str = "change-me-in-production"
     AUTH_TOKEN_TTL_MINUTES: int = 480

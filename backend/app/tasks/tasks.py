@@ -19,7 +19,7 @@ from app.utils.lead_identity import reusable_lead, copy_result, json_object
 from app.utils.logger import pipeline_logger
 from app.utils.company_logger import CompanyLogger
 
-from app.validators.icp_validator import ICPResult, _s, validate_icp
+from app.validators.icp_validator import ICPResult, validate_icp
 from app.validators.web_researcher import research_lead
 from app.validators.contact_verifier import ContactVerifyResult, verify_contact
 from app.scoring.scoring_engine import score_lead

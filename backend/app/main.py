@@ -31,10 +31,12 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import case, event, func, or_, update
 from sqlalchemy.orm import Session, joinedload, selectinload, load_only, noload
+from sqlalchemy.exc import DBAPIError
 
 from app.config import settings, SUPPORTED_EXTENSIONS
 from app.database import get_db, ping_db, schema_ready
@@ -78,6 +80,21 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition", "Content-Length", "Content-Range", "Accept-Ranges", "ETag"],
 )
+
+
+@app.exception_handler(DBAPIError)
+async def database_error_handler(request: Request, exc: DBAPIError):
+    # Driver messages may contain infrastructure details; keep them in server logs.
+    logger.error("Database request failed", exc_info=exc)
+    args = getattr(exc.orig, "args", ())
+    sqlstate = str(args[0]) if args else ""
+    unavailable = (exc.connection_invalidated or sqlstate.startswith("08")
+                   or sqlstate in {"HYT00", "HYT01"} or "(40615)" in str(exc.orig))
+    if unavailable:
+        return JSONResponse(status_code=503, content={
+            "detail": "Database unavailable. Check database connectivity and Azure SQL firewall access."
+        })
+    return JSONResponse(status_code=500, content={"detail": "Database request failed."})
 
 
 @app.middleware("http")
@@ -485,6 +502,12 @@ def job_results(
     }
     order_column = sort_columns[sort_by]
     order = order_column.desc() if sort_dir == "desc" else order_column.asc()
+    ordering = [order]
+    if sort_by == "priority":
+        ordering.append(FinalScore.total_score.desc())
+    if sort_by != "row_index":
+        ordering.append(Lead.row_index.asc())
+    ordering.append(Lead.id.asc())
     score_loader = joinedload(Lead.final_score)
     if not details:
         score_loader = score_loader.load_only(FinalScore.total_score, FinalScore.icp_score,
@@ -501,7 +524,7 @@ def job_results(
             selectinload(Lead.validation_results) if details else noload(Lead.validation_results),
             *summary_load,
         )
-        .order_by(order, FinalScore.total_score.desc() if sort_by == "priority" else Lead.row_index.asc(), Lead.row_index.asc(), Lead.id.asc())
+        .order_by(*ordering)
         .offset(offset)
         .limit(limit)
         .all()
