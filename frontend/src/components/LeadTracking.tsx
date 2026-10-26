@@ -4,7 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { updateLeadTracking, getLeadDetail } from '@/api/endpoints';
 import { useToast } from '@/components/ui/Toast';
 import type { LeadResult } from '@/types';
-import { invalidateLeadWorkspace } from '@/lib/workspace';
+import { invalidateLeadData } from '@/lib/leadCache';
 
 type Props = { lead: LeadResult; jobId: string; onSaved: (lead: LeadResult) => void; notes?: boolean };
 
@@ -27,7 +27,7 @@ export function LeadTracking({ lead, jobId, onSaved, notes = false }: Props) {
       const result = await updateLeadTracking(jobId, lead.lead_id, { version: lead.tracking_version, ...changes });
       onSaved(result);
       if (changes.notes !== undefined) setNotesDirty(false);
-      await invalidateLeadWorkspace(qc);
+      await invalidateLeadData(qc);
       if (changes.notes !== undefined) toast('Notes saved', 'success');
     } catch (cause) {
       const conflict = isAxiosError(cause) && cause.response?.status === 409;
@@ -37,7 +37,7 @@ export function LeadTracking({ lead, jobId, onSaved, notes = false }: Props) {
       if (conflict) {
         try { onSaved(await getLeadDetail(jobId, lead.lead_id)); }
         catch { setError('Your draft is retained, but the latest saved details could not be loaded. Reload before saving again.'); }
-        await invalidateLeadWorkspace(qc);
+        await invalidateLeadData(qc);
       }
     } finally { savingRef.current = false; setSaving(false); setPendingReviewed(null); }
   };

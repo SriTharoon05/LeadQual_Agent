@@ -21,6 +21,8 @@ from app.utils.db_availability import (
     database_retry_delay, database_unavailable_reason, warn_database_unavailable,
 )
 from app.utils.company_logger import CompanyLogger
+from app.admin.concurrency import LeadAdmission, CapacityDeferred, RuntimeLeaseLost, retry_delay
+from app.admin.billing import rate_limit_delay
 
 from app.validators.icp_validator import ICPResult, validate_icp
 from app.validators.web_researcher import research_lead
@@ -119,12 +121,17 @@ def process_lead(self, lead_id: str, icp_prompt: str):
     DB reuse check → Web → Contact → ICP using evidence → Score → DB
     """
     try:
-        with locked_lead_session(lead_id) as db:
+        with LeadAdmission(), locked_lead_session(lead_id) as db:
             return _process_lead(self, db, lead_id, icp_prompt)
+    except (CapacityDeferred, RuntimeLeaseLost):
+        raise self.retry(countdown=retry_delay(), max_retries=self.request.retries + 1)
     except TimeoutError as exc:
         # Contention does not consume the separate processing-error budget.
         raise self.retry(exc=exc, countdown=30, max_retries=self.request.retries + 1)
     except Exception as exc:
+        throttle = rate_limit_delay(exc, self.request.retries)
+        if throttle is not None:
+            raise self.retry(countdown=throttle, max_retries=self.request.retries + 1)
         if database_unavailable_reason(exc):
             # Infrastructure access failures do not describe the lead and must
             # never spend the paid-processing budget or mark it failed later.
@@ -366,7 +373,7 @@ def _process_lead(self, db, lead_id, icp_prompt):
         _mark_lead_finished(db, lead, failed=False)
 
     except Exception as exc:
-        if database_unavailable_reason(exc):
+        if isinstance(exc, (CapacityDeferred, RuntimeLeaseLost)) or rate_limit_delay(exc) is not None or database_unavailable_reason(exc):
             raise  # The outer task logs/backoffs; do not try writing a DB log.
         log.error(f"Pipeline error for {lead_id}: {exc}")
         try:
@@ -399,30 +406,8 @@ def finalise_job(self, results: list, job_id: str):
             job.status = "running"
             raise self.retry(countdown=30, max_retries=self.request.retries + 1)
 
-        # Aggregate token totals from llm_call_logs for this job
-        try:
-            from sqlalchemy import func as sqlfunc
-            from app.models import LLMCallLog
-            row = (
-                db.query(
-                    sqlfunc.sum(LLMCallLog.prompt_tokens).label("p"),
-                    sqlfunc.sum(LLMCallLog.completion_tokens).label("c"),
-                    sqlfunc.sum(LLMCallLog.total_tokens).label("t"),
-                )
-                .filter(LLMCallLog.job_id == job_id)
-                .first()
-            )
-            if row:
-                job.prompt_tokens     = int(row._mapping["p"] or 0)
-                job.completion_tokens = int(row._mapping["c"] or 0)
-                job.total_tokens_used = int(row._mapping["t"] or 0)
-                log.info(
-                    f"Token totals — prompt={job.prompt_tokens} "
-                    f"completion={job.completion_tokens} "
-                    f"total={job.total_tokens_used}"
-                )
-        except Exception as e:
-            logger.warning(f"Token rollup failed for job {job_id}: {e}")
+        # The usage outbox writer rolls up token counters after each durable batch.
+        # Finalisation must not overwrite those counters with a pre-flush snapshot.
 
         # Record which models were used
         try:

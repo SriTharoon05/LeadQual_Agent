@@ -34,18 +34,19 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import case, event, func, or_, update
+from sqlalchemy import BigInteger, cast, case, event, func, or_, update
 from sqlalchemy.orm import Session, joinedload, selectinload, load_only, noload
 from sqlalchemy.exc import DBAPIError, TimeoutError as SQLAlchemyTimeoutError
 
 from app.config import settings, SUPPORTED_EXTENSIONS
 from app.database import get_db, ping_db, schema_ready
 from app.utils.db_availability import database_unavailable_reason, warn_database_unavailable
-from app.models import (Job, Lead, FinalScore, AdminUser, LeadTracking, TeamMember, LeadRefresh,
+from app.admin.telemetry import configure_telemetry, set_context, clear_context, publish_event
+from app.models import (Job, Lead, FinalScore, AdminUser, LeadTracking, LeadRefresh,
                         ProcessingLog, LLMCallLog, ValidationResult, ChatConversation, ChatMessage)
 from app.lead_results import LeadResultResponse, latest_refreshes, lead_to_response as _lead_to_response
-from app.workspace.routes import router as workspace_router
-from app.workspace.filters import LeadFilters, filtered_query
+from app.admin.routes import router as admin_router
+from app.lead_filters import LeadFilters, filtered_query
 from app.refresh import router as refresh_router
 from app.utils.lead_identity import transaction_lock
 from app.export.routes import router as export_router
@@ -65,7 +66,7 @@ app = FastAPI(
     version="1.0.0",
 )
 app.include_router(chat_router)
-app.include_router(workspace_router)
+app.include_router(admin_router)
 app.include_router(refresh_router)
 app.include_router(export_router)
 
@@ -99,7 +100,21 @@ async def database_error_handler(request: Request, exc: DBAPIError | SQLAlchemyT
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    response = await call_next(request)
+    clear_context()
+    parts = request.url.path.split("/")
+    if len(parts) > 2 and parts[1] == "jobs":
+        try:
+            set_context(job_id=str(UUID(parts[2])))
+        except ValueError:
+            pass
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        publish_event(f"API request failed ({type(exc).__name__}). Check server diagnostics and retry after the service recovers.",
+                      severity="ERROR", kind="request_error", component="api")
+        raise
+    finally:
+        clear_context()
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -107,6 +122,17 @@ async def security_headers(request: Request, call_next):
     if settings.APP_ENV.lower() == "production":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
+
+
+@app.on_event("startup")
+def start_operations_telemetry():
+    configure_telemetry()
+
+
+@app.on_event("shutdown")
+def flush_operations_telemetry():
+    from app.admin.telemetry import flush_events
+    flush_events()
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -153,25 +179,6 @@ class TrackingUpdate(BaseModel):
     version: int = Field(ge=0)
     reviewed: Optional[bool] = None
     notes: Optional[str] = Field(default=None, max_length=10000)
-    owner_id: UUID | None = None
-    follow_up_at: datetime | None = None
-    follow_up_note: str | None = Field(default=None, max_length=10000)
-    follow_up_completed: bool | None = None
-
-    @field_validator("follow_up_at")
-    @classmethod
-    def validate_follow_up_time(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None:
-            raise ValueError("Follow-up time must include its timezone.")
-        try:
-            checked = value.astimezone(timezone.utc)
-            if checked.year < 1753 or checked > datetime(9999, 12, 31, 23, 59, 59, 997000, tzinfo=timezone.utc):
-                raise ValueError("Follow-up time must be within the supported calendar range.")
-        except OverflowError as exc:
-            raise ValueError("Follow-up time must be within the supported calendar range.") from exc
-        return value
 
 
 class UploadResponse(BaseModel):
@@ -456,10 +463,7 @@ def job_results(
     offset: int = Query(0,  ge=0,          description="Rows to skip (page offset)."),
     search: Optional[str] = Query(None, max_length=100),
     priority: Optional[Literal["High", "Medium", "Low"]] = None,
-    owner_id: UUID | None = None,
-    unassigned: bool = False,
     reviewed: bool | None = None,
-    follow_up: Literal["all", "due", "upcoming", "completed", "unscheduled"] = "all",
     country: str | None = Query(None, max_length=100),
     industry: str | None = Query(None, max_length=100),
     min_score: float | None = Query(None, ge=0, le=100),
@@ -481,8 +485,7 @@ def job_results(
     _get_job_or_404(job_id, db)
 
     try:
-        filters = LeadFilters(search=search or "", priority=priority, owner_id=owner_id,
-                              unassigned=unassigned, reviewed=reviewed, follow_up=follow_up,
+        filters = LeadFilters(search=search or "", priority=priority, reviewed=reviewed,
                               country=country or "", industry=industry or "",
                               min_score=min_score, evidence=evidence)
     except ValidationError as exc:
@@ -573,37 +576,14 @@ def update_tracking(job_id: str, lead_id: str, body: TrackingUpdate,
     if not lead.tracking_id:
         raise HTTPException(status_code=409, detail="Lead tracking requires the database migration")
     changes = {}
-    for field, column in (("reviewed", "reviewed"), ("notes", "notes"), ("follow_up_note", "follow_up_note")):
+    for field, column in (("reviewed", "reviewed"), ("notes", "notes")):
         if field in body.model_fields_set:
             value = getattr(body, field)
             if value is None:
                 raise HTTPException(status_code=422, detail=f"{field} cannot be null")
             changes[column] = value
-    if "owner_id" in body.model_fields_set:
-        transaction_lock(db, "ql:workspace:team")
-        if body.owner_id:
-            member = db.get(TeamMember, str(body.owner_id), populate_existing=True)
-            unchanged = str(body.owner_id) == str(lead.tracking.owner_id)
-            if not member or (not member.active and not unchanged):
-                raise HTTPException(status_code=422, detail="Choose an active team member, or unassign this lead.")
-        changes["owner_id"] = str(body.owner_id) if body.owner_id else None
-    if "follow_up_at" in body.model_fields_set:
-        due = body.follow_up_at
-        if due and due.tzinfo is None:
-            raise HTTPException(status_code=422, detail="Follow-up time must include its timezone.")
-        changes["follow_up_at"] = due.astimezone(timezone.utc).replace(tzinfo=None) if due else None
-        changes["follow_up_completed_at"] = None
-        if not due:
-            changes["follow_up_note"] = ""
-    if "follow_up_completed" in body.model_fields_set:
-        if body.follow_up_completed is None:
-            raise HTTPException(status_code=422, detail="Follow-up completion cannot be null.")
-        scheduled = changes.get("follow_up_at", lead.tracking.follow_up_at)
-        if body.follow_up_completed and not scheduled:
-            raise HTTPException(status_code=422, detail="Schedule a follow-up before marking it complete.")
-        changes["follow_up_completed_at"] = datetime.now(timezone.utc).replace(tzinfo=None) if body.follow_up_completed else None
     if not changes:
-        raise HTTPException(status_code=422, detail="Provide a tracking, owner, or follow-up change.")
+        raise HTTPException(status_code=422, detail="Provide a reviewed or notes change.")
     changes.update(version=LeadTracking.version + 1, updated_at=datetime.now(timezone.utc).replace(tzinfo=None))
     result = db.execute(update(LeadTracking).where(
         LeadTracking.id == lead.tracking_id, LeadTracking.version == body.version
@@ -689,15 +669,15 @@ def token_report(job_id: str, db: Session = Depends(get_db)):
         db.query(
             LLMCallLog.stage,
             LLMCallLog.module,
-            sqlfunc.sum(LLMCallLog.prompt_tokens).label("prompt"),
-            sqlfunc.sum(LLMCallLog.completion_tokens).label("completion"),
-            sqlfunc.sum(LLMCallLog.total_tokens).label("total"),
+            sqlfunc.sum(cast(LLMCallLog.prompt_tokens, BigInteger)).label("prompt"),
+            sqlfunc.sum(cast(LLMCallLog.completion_tokens, BigInteger)).label("completion"),
+            sqlfunc.sum(cast(LLMCallLog.total_tokens, BigInteger)).label("total"),
             sqlfunc.count(LLMCallLog.id).label("calls"),
             sqlfunc.avg(LLMCallLog.duration_ms).label("avg_ms"),
         )
         .filter(LLMCallLog.job_id == job_id)
         .group_by(LLMCallLog.stage, LLMCallLog.module)
-        .order_by(sqlfunc.sum(LLMCallLog.total_tokens).desc())
+        .order_by(sqlfunc.sum(cast(LLMCallLog.total_tokens, BigInteger)).desc())
         .all()
     )
 

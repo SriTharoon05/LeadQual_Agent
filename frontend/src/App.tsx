@@ -11,7 +11,10 @@ const LoginPage = lazy(() => import('@/pages/LoginPage').then((m) => ({ default:
 const DashboardPage = lazy(() => import('@/pages/DashboardPage').then((m) => ({ default: m.DashboardPage })));
 const UploadPage = lazy(() => import('@/pages/UploadPage').then((m) => ({ default: m.UploadPage })));
 const JobDetailPage = lazy(() => import('@/pages/JobDetailPage').then((m) => ({ default: m.JobDetailPage })));
-const LeadWorkspacePage = lazy(() => import('@/pages/LeadWorkspacePage').then((m) => ({ default: m.LeadWorkspacePage })));
+
+const AdminSettingsPage = lazy(() => import('@/pages/AdminSettingsPage').then((m) => ({ default: m.AdminSettingsPage })));
+const AdminCostPage = lazy(() => import('@/pages/AdminCostPage').then((m) => ({ default: m.AdminCostPage })));
+const AdminLogsPage = lazy(() => import('@/pages/AdminLogsPage').then((m) => ({ default: m.AdminLogsPage })));
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -40,12 +43,16 @@ export default function App() {
       <ToastProvider>
         <BrowserRouter>
           <ExportProvider>
-          <Suspense fallback={<div className="min-h-screen bg-sky-gradient grid place-items-center text-sm text-slate-500">Loading workspace…</div>}>
+          <Suspense fallback={<div className="min-h-screen bg-sky-gradient grid place-items-center text-sm text-slate-500">Loading application…</div>}>
           <Routes>
             <Route path="/login" element={isLoggedIn() ? <Navigate to="/dashboard" replace /> : <LoginPage />} />
             <Route path="/dashboard" element={<ProtectedRoute><DashboardPage /></ProtectedRoute>} />
             <Route path="/upload"    element={<ProtectedRoute><UploadPage /></ProtectedRoute>} />
-            <Route path="/leads" element={<ProtectedRoute><LeadWorkspacePage /></ProtectedRoute>} />
+            <Route path="/admin/settings" element={<ProtectedRoute><AdminSettingsPage /></ProtectedRoute>} />
+            <Route path="/admin/cost" element={<ProtectedRoute><AdminCostPage /></ProtectedRoute>} />
+            <Route path="/admin/cost/:jobId" element={<ProtectedRoute><AdminCostPage /></ProtectedRoute>} />
+            <Route path="/admin/cost/:jobId/:leadId" element={<ProtectedRoute><AdminCostPage /></ProtectedRoute>} />
+            <Route path="/admin/logs" element={<ProtectedRoute><AdminLogsPage /></ProtectedRoute>} />
             <Route path="/jobs/:jobId" element={<ProtectedRoute><JobDetailPage /></ProtectedRoute>} />
             <Route path="/" element={<Navigate to={isLoggedIn() ? '/dashboard' : '/login'} replace />} />
             <Route path="*" element={<Navigate to="/dashboard" replace />} />

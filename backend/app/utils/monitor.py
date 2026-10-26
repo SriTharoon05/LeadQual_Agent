@@ -72,6 +72,8 @@ _ctx_company: ContextVar[str] = ContextVar("mon_company", default="-")
 
 def bind_context(job_id=None, lead_id=None, company=None) -> None:
     """Stamp subsequent log lines (this task/thread) with these identifiers."""
+    from app.admin.telemetry import set_context
+    set_context(job_id=job_id, lead_id=lead_id, company=company)
     if job_id is not None:
         _ctx_job.set(_short(job_id, 8))
     if lead_id is not None:

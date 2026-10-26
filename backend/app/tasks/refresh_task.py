@@ -26,6 +26,8 @@ from app.utils.db_availability import (
 from app.validators.contact_verifier import verify_contact
 from app.validators.icp_validator import validate_icp
 from app.validators.web_researcher import research_lead
+from app.admin.concurrency import LeadAdmission, CapacityDeferred, RuntimeLeaseLost, retry_delay
+from app.admin.billing import rate_limit_delay
 
 logger = logging.getLogger(__name__)
 MAX_RESEARCH_ATTEMPTS = 4
@@ -97,13 +99,18 @@ def refresh_lead(self, request_id: str, lead_id: str):
     resume its running request. The persisted budget bounds repeated paid work.
     """
     try:
-        with locked_lead_session(lead_id) as db:
+        with LeadAdmission(), locked_lead_session(lead_id) as db:
             return _refresh(db, request_id, lead_id)
+    except (CapacityDeferred, RuntimeLeaseLost):
+        raise self.retry(countdown=retry_delay(), max_retries=self.request.retries + 1)
     except TimeoutError as exc:
         # Contention consumes transport retries, not research attempts. Status
         # reconciliation can redispatch if the bounded retries are exhausted.
         raise self.retry(exc=exc, countdown=30)
     except Exception as exc:
+        throttle = rate_limit_delay(exc, self.request.retries)
+        if throttle is not None:
+            raise self.retry(countdown=throttle, max_retries=self.request.retries + 1)
         if database_unavailable_reason(exc):
             warn_database_unavailable(logger, "Evidence refresh", exc)
             raise self.retry(
@@ -137,6 +144,8 @@ def _refresh(db, request_id: str, lead_id: str):
         return
     lead_data = _lead_to_dict(lead)
     icp_prompt, job_id = job.icp_prompt, str(job.id)
+    from app.admin.telemetry import set_context
+    set_context(job_id=job_id, lead_id=lead_id, stage="evidence_refresh")
     if run.previous_snapshot_json is None:
         run.previous_snapshot_json = _snapshot(db, lead)
     run.status = "running"
@@ -218,7 +227,16 @@ def _refresh(db, request_id: str, lead_id: str):
         return
     except Exception as exc:
         db.rollback()
-        if database_unavailable_reason(exc):
+        if rate_limit_delay(exc) is not None or isinstance(exc, CapacityDeferred):
+            run = db.get(LeadRefresh, request_id)
+            if run is not None and run.status not in ("completed", "failed"):
+                # Throttling is infrastructure pressure, not bad lead evidence.
+                run.attempt_count = attempts
+                run.status = "queued"
+                run.last_dispatched_at = _now()
+                db.commit()
+            raise
+        if isinstance(exc, (CapacityDeferred, RuntimeLeaseLost)) or database_unavailable_reason(exc):
             # Leave the durable running request and prior saved result intact.
             # An unavailable SQL connection is not a failed research outcome.
             raise

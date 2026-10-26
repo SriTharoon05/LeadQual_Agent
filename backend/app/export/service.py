@@ -1,7 +1,7 @@
 """Shared export coordination. Redis stores small states, Blob stores files.
 
 No local file paths or bearer tokens are exposed. Cache revisions cover saved
-results, shared tracking/owners and refresh activity; downloads are snapshots.
+results, reviewed state/notes and refresh activity; downloads are snapshots.
 """
 import hashlib
 import json
@@ -18,11 +18,11 @@ from azure.storage.blob import BlobServiceClient
 from sqlalchemy import BigInteger, case, cast, func
 
 from app.config import settings
-from app.models import FinalScore, Job, Lead, LeadRefresh, LeadTracking, TeamMember
+from app.models import FinalScore, Job, Lead, LeadRefresh, LeadTracking
 from app.scoring.policy import SCORING_VERSION
 
 logger = logging.getLogger(__name__)
-EXPORT_VERSION = "streaming-v2-" + SCORING_VERSION
+EXPORT_VERSION = "streaming-v3-admin-" + SCORING_VERSION
 STATE_TTL = 86_400
 LEASE_SECONDS = 90
 WORKERS_KEY = "ql:exports:workers"
@@ -55,11 +55,8 @@ def source_revision(db, job):
     """Small SQL aggregates, not a scan of multi-megabyte evidence JSON."""
     leads = db.query(func.count(Lead.id), func.max(Lead.evidence_checked_at),
         func.coalesce(func.sum(cast(LeadTracking.version, BigInteger)), 0),
-        func.max(LeadTracking.updated_at),
-        func.coalesce(func.sum(cast(TeamMember.version, BigInteger)), 0),
-        func.max(TeamMember.updated_at)
+        func.max(LeadTracking.updated_at)
     ).select_from(Lead).outerjoin(LeadTracking, LeadTracking.id == Lead.tracking_id
-    ).outerjoin(TeamMember, TeamMember.id == LeadTracking.owner_id
     ).filter(Lead.job_id == job.id).one()
     scores = db.query(func.count(FinalScore.id), func.max(FinalScore.created_at)
     ).join(Lead, Lead.id == FinalScore.lead_id).filter(Lead.job_id == job.id).one()

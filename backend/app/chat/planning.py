@@ -30,32 +30,29 @@ SCORE_FIELDS = {
     "qualification_status": "Qualification status", "scoring_version": "Scoring policy",
 }
 TRACKING_FIELDS = {"reviewed": "Reviewed", "tracking_notes": "Tracking notes"}
-WORKFLOW_DISPLAY_FIELDS = {
-    "owner_name": "Lead owner", "owner_active": "Owner active",
-    "follow_up_at": "Follow-up at (UTC)", "follow_up_note": "Follow-up note",
-    "follow_up_completed_at": "Follow-up completed at (UTC)", "follow_up_status": "Follow-up status",
+EVIDENCE_DISPLAY_FIELDS = {
     "evidence_checked_at": "Evidence checked at (UTC)", "evidence_age_days": "Evidence age (days)",
     "evidence_status": "Evidence freshness", "refresh_status": "Refresh status",
     "website_ingest_status": "Saved website indexing status",
 }
 DISPLAY_FIELDS = {**LEAD_FIELDS, **SCORE_FIELDS, **TRACKING_FIELDS,
-                  **WORKFLOW_DISPLAY_FIELDS,
+                  **EVIDENCE_DISPLAY_FIELDS,
                   "row_number": "Row", "icp_validation_proofs": "ICP validation proofs",
                   "icp_input": "ICP input", "contact_availability": "Contact availability",
                   "employment_status": "Current employment", "stored_website_context": "Stored website evidence"}
 NUMERIC_FIELDS = {"total_score", "icp_score", "growth_score",
                   "contact_score", "row_number", "employee_count", "annual_revenue", "evidence_age_days"}
-DATE_FIELDS = {"follow_up_at", "follow_up_completed_at", "evidence_checked_at"}
-BOOLEAN_FIELDS = {"reviewed", "owner_active"}
+DATE_FIELDS = {"evidence_checked_at"}
+BOOLEAN_FIELDS = {"reviewed"}
 FILTER_FIELDS = (set(LEAD_FIELDS) | set(SCORE_FIELDS) | set(TRACKING_FIELDS)
-                 | set(WORKFLOW_DISPLAY_FIELDS) | {"row_number", "employment_status"})
+                 | set(EVIDENCE_DISPLAY_FIELDS) | {"row_number", "employment_status"})
 OPERATORS = {"eq", "ne", "contains", "gt", "gte", "lt", "lte", "is_missing", "is_present"}
 AGGREGATE_OPS = {"avg", "sum", "min", "max", "count_distinct"}
 CURRENCY_CODES = {"USD", "EUR", "GBP", "INR", "CAD", "AUD", "JPY", "CNY", "CHF", "NZD", "SGD", "HKD", "AED"}
 CURRENCY_FILTER_VALUES = CURRENCY_CODES | {"$", "€", "£", "₹", "¥"}
 GROUP_FIELDS = {"company_name", "industry", "sub_industry", "company_country", "company_state_region",
                 "company_city", "contact_country", "contact_department", "contact_seniority",
-                "priority", "processing_status", "reviewed", "owner_name", "follow_up_status",
+                "priority", "processing_status", "reviewed",
                 "evidence_status", "refresh_status", "employment_status", "qualification_status", "website_ingest_status"}
 MAX_PAGE_SIZE = 30
 
@@ -243,8 +240,6 @@ _FIELD_PATTERNS = [
     (r"\b(?:website|web site|domain)\b", ["company_website"]),
     (r"\b(?:notes|note)\b", ["notes", "tracking_notes"]),
     (r"\b(?:reviewed|unreviewed)\b", ["reviewed"]),
-    (r"\b(?:owner|ownership|owns|assign|assigned|unassigned|assignment|responsible)\b", ["owner_name", "owner_active"]),
-    (r"\b(?:follow[- ]?ups?|reminders?|due|overdue|upcoming|scheduled|unscheduled)\b", ["follow_up_at", "follow_up_note", "follow_up_completed_at", "follow_up_status"]),
     (r"\b(?:freshness|fresh|stale|last checked|last verified|verification date|checked date|checked at|evidence age|evidence date|outdated)\b|\b(?:how old|days old)\b.*\bevidence\b|\bevidence\b.*\b(?:old|age)\b|\bage of (?:the )?evidence\b", ["evidence_checked_at", "evidence_age_days", "evidence_status"]),
     (r"\b(?:refresh|refreshed|refreshing)\b", ["refresh_status", "evidence_checked_at", "evidence_status"]),
     (r"\b(?:index|indexed|indexing|embedding|embeddings|vector database|vector db)\b", ["website_ingest_status", "stored_website_context"]),
@@ -285,11 +280,6 @@ def row_numbers(message: str) -> list[int]:
         if 1 <= start <= end and end - start < MAX_PAGE_SIZE:
             values.extend(range(start, end + 1))
     return list(dict.fromkeys(value for value in values if 1 <= value <= 1000000))[:MAX_PAGE_SIZE]
-
-
-def workflow_filter_request(message: str, plan: QueryPlan) -> bool:
-    """Compatibility guard: workflow predicates now have explicit SQL support."""
-    return False
 
 
 def deterministic_plan(message: str, previous: dict | None = None) -> QueryPlan:
@@ -375,14 +365,9 @@ def deterministic_plan(message: str, previous: dict | None = None) -> QueryPlan:
     crm_id = re.search(r"\b(?:crm\s+)?(account|contact)\s+id\s*(?:is|=|:)?\s*([A-Za-z0-9][A-Za-z0-9_-]{1,99})", message, re.I)
     if crm_id:
         plan.filters.append({"field": "crm_account_id" if crm_id.group(1).lower() == "account" else "crm_contact_id", "op": "eq", "value": crm_id.group(2)})
-    if not plan.row_numbers and re.search(r"\b(?:leads|records|contacts|reminders|follow[- ]?ups)\b", low):
-        if re.search(r"\b(?:overdue|due|upcoming|unscheduled)\b", low):
-            status = "due" if re.search(r"\b(?:overdue|due)\b", low) else "upcoming" if "upcoming" in low else "unscheduled"
-            plan.filters.append({"field": "follow_up_status", "op": "eq", "value": status})
+    if not plan.row_numbers and re.search(r"\b(?:leads|records|contacts)\b", low):
         if re.search(r"\b(?:fresh|stale|outdated)\b", low):
             plan.filters.append({"field": "evidence_status", "op": "eq", "value": "fresh" if re.search(r"\bfresh\b", low) else "stale"})
-        if re.search(r"\b(?:unassigned|without (?:an? )?owner)\b", low):
-            plan.filters.append({"field": "owner_name", "op": "is_missing", "value": None})
     if re.search(r"\b(?:average|mean|sum|minimum|maximum|average of)\b", low) and not re.search(r"\b(?:company|person|contact)\b", low):
         plan.understood = False
     plan.compose = bool(re.search(r"\b(?:why|explain|compare|recommend|outreach|pitch|insight|strategy|summar|what does|what do|tell me (?:about|abouy)|about (?:that|this) company)\b", low))
@@ -393,10 +378,6 @@ def deterministic_plan(message: str, previous: dict | None = None) -> QueryPlan:
                       or re.search(r"\b(?:show|list|find|get|give|details|contact|contacts|leads|records|about|company|companies)\b", low))
     plan.understood = actionable and not complex_terms
     if re.search(r"\b(?:average|mean|sum|median|minimum|maximum|group(?:ed)? by|per industry|by country)\b", low):
-        plan.understood = False
-    # Workflow values can be read for a record/company. They are intentionally
-    # not executable filter/sort predicates, so never silently ignore a clause.
-    if workflow_filter_request(message, plan):
         plan.understood = False
     if re.search(r"\b(?:software|services|technology|it)\s+(?:companies|company|leads|contacts|industry)\b|\b(?:high|medium|low)\s+(?:revenue|employees|headcount|size)\b", low):
         plan.understood = False
@@ -435,16 +416,15 @@ def planner_prompt() -> str:
         "Company/contact name comparisons belong in entities; do not place them in OR groups. "
         "Entities within a kind are alternative names; company and person scopes combine with AND. "
         "If a question instead requires OR across company and person scopes, ask to split/clarify it. "
-        "A country, industry, role, owner name or field label is not a company/contact entity. "
+        "A country, industry, role or field label is not a company/contact entity. "
         "Phone availability means either contact phone. Missing phone means both absent. "
         "notes means imported notes; tracking_notes means shared team notes. For unqualified 'any notes', "
         "use OR of both fields present; 'no notes' means both fields missing. Contact placeholders such as "
         "N/A, unknown and '-' count as missing email/phone data, not reachable channels. "
-        "Unassigned means owner_name is_missing; overdue means follow_up_status eq due. "
-        "follow_up_status=unscheduled/due/upcoming/completed; evidence_status=unknown/fresh/stale; "
+        "evidence_status=unknown/fresh/stale; "
         "employment_status=current/former/unclear, based on saved evidence only. "
-        "Workflow fields can be displayed, filtered and sorted. They report internal team metadata. "
-        "You cannot assign leads, update notes, send messages, schedule reminders or refresh research through chat.\n"
+        "Reviewed and notes fields describe saved tracking. Team assignment, follow-up reminders and saved groups have been removed. "
+        "You cannot edit records, send messages or refresh research through chat.\n"
         "action aggregate supports aggregate=avg/sum/min/max/count_distinct, metric=one allowed field, "
         "optional group_by=one allowed grouping field. Numeric operators require a numeric metric; "
         "count_distinct can use a supported text/group field. Do not use avg/sum for company headcount/revenue "

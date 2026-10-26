@@ -45,7 +45,7 @@ from app.config import (
 )
 from app.database import SessionLocal
 from app.models import FinalScore, Job, Lead, LeadRefresh, ValidationResult
-from app.lead_results import follow_up_status, freshness, utc
+from app.lead_results import freshness, utc
 from app.utils.lead_identity import json_object
 from app.validators.evidence import proof_rows
 from app.validators.contact_policy import saved_contact
@@ -56,8 +56,7 @@ logger = logging.getLogger(__name__)
 ALL_COLUMNS: list[str] = CANONICAL_COLUMNS + EXPORT_EXTRA_COLUMNS + [
     "Row Number", "Lead ID", "Processing Status", "Reviewed", "Tracking Notes", "Reuse Type", "Reused From Lead ID", "ICP Input",
     "Evidence Checked At", "Current Employment", "ICP Validation Proofs",
-    "Lead Owner", "Owner Active", "Follow-up At (UTC)", "Follow-up Note",
-    "Follow-up Completed At (UTC)", "Follow-up Status", "Evidence Age (Days)",
+    "Evidence Age (Days)",
     "Evidence Status", "Refresh Status", "Export Warnings", "Export Snapshot At (UTC)",
 ]
 
@@ -158,7 +157,6 @@ def _lead_row(lead, now, refresh_status="") -> dict:
                                  for vr in lead.validation_results}, ensure_ascii=False, default=str)
         logger.warning("Export retained unformatted legacy evidence for lead %s", lead.id)
     tracking = lead.tracking
-    owner = tracking.owner if tracking else None
     evidence_status, evidence_age = freshness(lead.evidence_checked_at, now)
     row.update({
         "Reviewed": "Yes" if lead.tracking and lead.tracking.reviewed else "No",
@@ -169,12 +167,6 @@ def _lead_row(lead, now, refresh_status="") -> dict:
         "Evidence Checked At": _fmt_date(lead.evidence_checked_at),
         "Current Employment": web_data.get("employment_status", "unclear"),
         "ICP Validation Proofs": proof_text or "Evidence unavailable for this earlier result",
-        "Lead Owner": owner.name if owner else "",
-        "Owner Active": ("Yes" if owner.active else "No") if owner else "",
-        "Follow-up At (UTC)": _fmt_date(tracking.follow_up_at) if tracking else "",
-        "Follow-up Note": (tracking.follow_up_note or "") if tracking else "",
-        "Follow-up Completed At (UTC)": _fmt_date(tracking.follow_up_completed_at) if tracking else "",
-        "Follow-up Status": follow_up_status(tracking, now),
         "Evidence Age (Days)": evidence_age if evidence_age is not None else "",
         "Evidence Status": evidence_status,
         "Refresh Status": refresh_status,

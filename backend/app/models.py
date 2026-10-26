@@ -9,11 +9,12 @@ Import pattern everywhere else:
 """
 
 import uuid
+from decimal import Decimal
 from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    Boolean, DateTime, Float, ForeignKey,
+    BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Numeric,
     Index, Integer, String, Text, Unicode, UnicodeText, UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
@@ -64,9 +65,9 @@ class Job(Base):
     # ── Add to Job model (inside the class, after existing mapped_column lines) ──
     llm_model:      Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     embed_model:    Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    total_tokens_used: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    prompt_tokens:  Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    completion_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_tokens_used: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    prompt_tokens:  Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    completion_tokens: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     # Relationships
     leads: Mapped[list["Lead"]] = relationship(
@@ -98,6 +99,7 @@ class Job(Base):
 # ── llm_call_logs ─────────────────────────────────────────────────────────────
 class LLMCallLog(Base):
     __tablename__ = "llm_call_logs"
+    __table_args__ = (Index("ix_usage_job_lead_stage", "job_id", "lead_id", "stage"),)
 
     id: Mapped[str] = mapped_column(
         UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
@@ -117,6 +119,19 @@ class LLMCallLog(Base):
     duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     use_web_search: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     web_search_calls: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
+    billing_model: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    cached_prompt_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    search_requests: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    status: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    provider_request_id: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    cost_input_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 10), nullable=True)
+    cost_cached_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 10), nullable=True)
+    cost_output_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 10), nullable=True)
+    cost_search_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 10), nullable=True)
+    cost_total_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 10), nullable=True)
+    cost_complete: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    pricing_snapshot_json: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True, deferred=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.getutcdate()
     )
@@ -124,6 +139,41 @@ class LLMCallLog(Base):
     def __repr__(self) -> str:
         return (f"<LLMCallLog stage={self.stage} tokens={self.total_tokens} "
                 f"job={self.job_id}>")
+
+
+class RuntimeSettings(Base):
+    __tablename__ = "runtime_settings"
+    __table_args__ = (CheckConstraint("concurrency >= 1 AND concurrency <= 30", name="ck_runtime_concurrency"),)
+    id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    concurrency: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    pricing_json: Mapped[str] = mapped_column(UnicodeText, nullable=False)
+    usd_inr: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    fx_as_of: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    fx_source: Mapped[Optional[str]] = mapped_column(Unicode(500), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    updated_by: Mapped[Optional[str]] = mapped_column(Unicode(100), nullable=True)
+
+
+class OperationalEvent(Base):
+    __tablename__ = "operational_events"
+    __table_args__ = (
+        Index("ix_events_job_id", "job_id", "id"),
+        CheckConstraint("severity IN ('WARNING','ERROR')", name="ck_events_severity"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+    # No FK: retain diagnostics when the associated upload is deleted.
+    job_id: Mapped[Optional[str]] = mapped_column(UNIQUEIDENTIFIER, nullable=True)
+    lead_id: Mapped[Optional[str]] = mapped_column(UNIQUEIDENTIFIER, nullable=True)
+    severity: Mapped[str] = mapped_column(String(10), nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    stage: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    component: Mapped[Optional[str]] = mapped_column(Unicode(100), nullable=True)
+    message: Mapped[str] = mapped_column(Unicode(2000), nullable=False)
+    retry_after: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.getutcdate())
 
 # ── leads ─────────────────────────────────────────────────────────────────────
 class TeamMember(Base):
@@ -157,7 +207,7 @@ class LeadTracking(Base):
     updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     owner_id: Mapped[Optional[str]] = mapped_column(
         UNIQUEIDENTIFIER, ForeignKey("team_member.id"), nullable=True, index=True)
-    owner: Mapped[Optional["TeamMember"]] = relationship(lazy="joined")
+    owner: Mapped[Optional["TeamMember"]] = relationship(lazy="noload")  # Legacy schema only.
     follow_up_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     follow_up_note: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
     follow_up_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

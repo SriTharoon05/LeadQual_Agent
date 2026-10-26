@@ -1,5 +1,11 @@
 # Quality Lead API and workers
 
+For the current SQL-backed concurrency slider, live warning/error feeds,
+job/lead/stage costs in USD/INR and the required migration, see
+[the admin operations rollout guide](RELEASE_ADMIN_OPERATIONS.md). This release
+removes team profiles, assignments, reminders, saved groups and the lead workspace.
+Reviewed checkboxes, notes and evidence refresh remain.
+
 For durable upload/qualification dispatch, idempotent upload retries, asynchronous
 website indexing, compact table responses and the required first migration, see
 [the performance rollout guide](RELEASE_PERFORMANCE.md).
@@ -12,9 +18,9 @@ see [the release and rollout guide](RELEASE_LEAD_REUSE.md).
 For full-job chatbot retrieval, ordered history, safe retries, and its required
 database migration, see [the chat rollout guide](RELEASE_CHAT_RELIABILITY.md).
 
-For team assignments, in-app follow-up reminders, saved lead groups, evidence
-freshness/manual refresh, and required database upgrades, see
-[the team workflow rollout guide](RELEASE_TEAM_WORKFLOW.md).
+The [historical team workflow guide](RELEASE_TEAM_WORKFLOW.md) retains prior
+schema-upgrade instructions needed for evidence freshness/manual refresh.
+Its removed team/workspace features are superseded by the admin operations guide.
 
 For deterministic ICP/contact/growth scoring, honest contact evidence, focused
 chat answers, and recalculation of existing results, see
@@ -28,10 +34,11 @@ Start locally after configuring `.env`:
 
 ```powershell
 uvicorn app.main:app --reload --port 8000
-celery -A app.celery_app.celery worker --loglevel=info -Q lead_processing,lead_imports,lead_embeddings --pool=solo
+celery -A app.celery_app.celery worker --loglevel=info -Q lead_processing --pool=threads --concurrency=30 --hostname=qualification@%h
 ```
 
-Include `lead_exports` in the worker queue list when testing background exports.
+Run imports, embeddings and exports on separate workers as shown in the admin
+operations guide. A solo worker cannot use the full saved concurrency range.
 Install all backend dependencies with `python -m pip install -r requirements.txt`;
 export workers require XlsxWriter even when no export has been requested yet.
 
@@ -58,7 +65,8 @@ after access returns. Qualification connection errors do not spend the separate
 research-error retry budget or mark leads failed. A programming error such as an
 invalid SQL query remains an application error rather than being called a network
 outage. Restart the API and **all Celery workers** after updating this code; these
-fixes add no database migration. Previously documented migrations still apply.
+earlier fixes add no database migration. The new admin operations release does
+require its migration, and previously documented migrations still apply.
 
 The ODBC 17 connection URL no longer passes the unsupported SqlClient
 `Connection Timeout` keyword. The existing `pyodbc.connect(timeout=30)` argument

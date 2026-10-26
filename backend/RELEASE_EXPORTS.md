@@ -9,7 +9,7 @@ histories or score audit snapshots. Only the chosen format is generated.
 Every saved row in the completed upload is included, regardless of the current
 table page, search, sort or priority filter. Stable source row numbers, lead IDs,
 processing status, all existing exported contact/company fields, scores,
-proofs, outreach, notes, owners and reminders are included. Rows retain source
+proofs, outreach, reviewed checkboxes and notes are included. Rows retain source
 order. Failed lead rows in a completed upload retain their saved fields and
 blank unavailable scores; they are not silently dropped.
 
@@ -41,12 +41,12 @@ storage reachable only by the API/worker. Transfers still depend on the browser,
 network, storage and hosting provider; unlimited transfer speed is not promised.
 
 Requests for the same snapshot/format reuse ready files for ten minutes by
-default. Changes to tracked notes/review/assignment/reminders, team owners,
+default. Changes to tracked notes/review,
 refreshed results and refresh activity change the cache revision. Pending builds
 for the same job/format are shared even if someone edits the data meanwhile.
 The worker checks row counts and revisions before publishing and retries a
 changed dataset, rather than offering an incomplete or mixed export. Time-based
-reminder/freshness fields are evaluated at the displayed snapshot time.
+freshness fields are evaluated at the displayed snapshot time.
 Download again retrieves that prepared snapshot; clicking the table's export
 button requests the latest saved revision.
 

@@ -1,5 +1,11 @@
 # Quality Lead — end-to-end technical explanation
 
+**Current release:** follow [the admin operations guide](backend/RELEASE_ADMIN_OPERATIONS.md)
+for SQL-backed concurrency, warning/error logs and detailed usage costs. Team
+profiles, assignments, follow-up reminders, saved groups and the lead workspace
+have been removed. Earlier architecture/scoring descriptions below are historical;
+the scoring v2 and subsequent release guides describe the current behavior.
+
 ## What the system does
 
 Quality Lead turns CRM-style CSV/Excel batches into researched and ranked B2B leads. A user uploads a file, describes the Ideal Customer Profile (ICP), and receives validated contact data, web-backed company intelligence, a deterministic weighted score, priority, explanations, growth signals, and actionable Outreach Intelligence.

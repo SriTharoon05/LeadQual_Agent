@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # ── Redis / Celery ────────────────────────────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"
-    MAX_WORKERS: int = 10
+    MAX_WORKERS: int = 10  # Legacy only; runtime_settings.concurrency is authoritative.
     CELERY_IMPORT_QUEUE: str = "lead_imports"
     CELERY_EMBED_QUEUE: str = "lead_embeddings"
     CELERY_EXPORT_QUEUE: str = "lead_exports"

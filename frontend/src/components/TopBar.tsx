@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useLocation } from 'react-router-dom';
-import { Sparkles, LogOut, Activity, LayoutDashboard, Upload, Users, Bell } from 'lucide-react';
-import { getHealth, getReminders } from '@/api/endpoints';
+import { Sparkles, LogOut, Activity, LayoutDashboard, Upload, Settings, DollarSign, AlertTriangle } from 'lucide-react';
+import { getHealth } from '@/api/endpoints';
 import { clearAuth, getUser } from '@/lib/auth';
 import { useToast } from '@/components/ui/Toast';
 
@@ -20,12 +20,6 @@ export function TopBar() {
   });
 
   const healthy = health?.status === 'ok' || health?.status === 'healthy';
-  const { data: reminders } = useQuery({
-    queryKey: ['workspace-reminders', 'badge'],
-    queryFn: () => getReminders('due', 0, 1),
-    refetchInterval: 60_000,
-  });
-
   const handleLogout = () => {
     clearAuth();
     queryClient.clear();
@@ -35,16 +29,18 @@ export function TopBar() {
   };
 
   const navLink = (to: string, label: string, icon: React.ReactNode) => {
-    const active = location.pathname === to || (to === '/dashboard' && location.pathname.startsWith('/jobs'));
+    const active = location.pathname === to || (to === '/dashboard' && location.pathname.startsWith('/jobs')) || (to === '/admin/cost' && location.pathname.startsWith('/admin/cost/'));
     return (
       <Link
         to={to}
-        className={`inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
+        title={label}
+        aria-label={label}
+        className={`inline-flex items-center gap-2 rounded-lg px-2 md:px-3 py-1.5 text-sm font-medium transition-colors ${
           active ? 'bg-brand-100 text-brand-700' : 'text-slate-600 hover:bg-brand-50 hover:text-brand-700'
         }`}
       >
         {icon}
-        {label}
+        <span className="hidden lg:inline">{label}</span>
       </Link>
     );
   };
@@ -52,28 +48,26 @@ export function TopBar() {
   return (
     <header className="sticky top-0 z-40 border-b border-slate-200/70 bg-white/80 backdrop-blur-md">
       <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center gap-8">
+        <div className="flex items-center gap-2 sm:gap-4">
           <Link to="/dashboard" className="flex items-center gap-2.5">
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-gradient shadow-brand">
               <Sparkles className="h-5 w-5 text-white" />
             </div>
-            <span className="hidden sm:block text-lg font-bold text-slate-800">LeadQual<span className="text-brand-600">AI</span></span>
+            <span className="hidden xl:block text-lg font-bold text-slate-800">LeadQual<span className="text-brand-600">AI</span></span>
           </Link>
-          <nav className="hidden md:flex items-center gap-1">
+          <nav className="flex items-center gap-1">
             {navLink('/dashboard', 'Dashboard', <LayoutDashboard className="h-4 w-4" />)}
             {navLink('/upload', 'Upload', <Upload className="h-4 w-4" />)}
-            {navLink('/leads', 'Leads', <Users className="h-4 w-4" />)}
+            {navLink('/admin/settings', 'Settings', <Settings className="h-4 w-4" />)}
+            {navLink('/admin/cost', 'Costs', <DollarSign className="h-4 w-4" />)}
+            {navLink('/admin/logs', 'Warnings', <AlertTriangle className="h-4 w-4" />)}
           </nav>
         </div>
 
         <div className="flex items-center gap-3">
-          <Link to="/dashboard" title="Due follow-up reminders" aria-label={reminders ? `${reminders.counts.due} due follow-up reminders` : 'Open follow-up reminders'} className="relative rounded-lg p-2 text-slate-600 hover:bg-brand-50">
-            <Bell className="h-4 w-4" />
-            {!!reminders?.counts.due && <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-rose-500 px-1 text-center text-[10px] font-semibold text-white">{reminders.counts.due > 99 ? '99+' : reminders.counts.due}</span>}
-          </Link>
           {/* Health pill */}
           <div
-            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold ring-1 ring-inset ${
+            className={`hidden sm:inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold ring-1 ring-inset ${
               healthy
                 ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
                 : 'bg-rose-50 text-rose-700 ring-rose-200'
@@ -81,12 +75,12 @@ export function TopBar() {
             title={healthy ? 'System healthy' : 'System unreachable'}
           >
             <Activity className={`h-3.5 w-3.5 ${healthy ? '' : 'animate-pulse'}`} />
-            <span className="hidden sm:inline">System {healthy ? 'healthy' : 'unreachable'}</span>
+            <span className="hidden lg:inline">System {healthy ? 'healthy' : 'unreachable'}</span>
             <span className="sm:hidden">{healthy ? 'OK' : 'Down'}</span>
           </div>
 
           {username && (
-            <span className="hidden sm:block text-sm text-slate-500">
+            <span className="hidden xl:block text-sm text-slate-500">
               <span className="text-slate-400">Hi,</span> <span className="font-medium text-slate-700">{username}</span>
             </span>
           )}

@@ -1,30 +1,20 @@
 import type { QueryClient } from '@tanstack/react-query';
 import type { LeadResult } from '@/types';
 
-export async function invalidateLeadWorkspace(client: QueryClient) {
+export async function invalidateLeadData(client: QueryClient) {
   await Promise.all([
     client.invalidateQueries({ queryKey: ['job-results'] }),
-    client.invalidateQueries({ queryKey: ['workspace-leads'] }),
-    client.invalidateQueries({ queryKey: ['workspace-reminders'] }),
     client.invalidateQueries({ queryKey: ['dashboard-stats'] }),
   ]);
 }
 
-// The API stores UTC; date/time inputs and reminder labels use the user's timezone.
-export function localDateTime(value: string | null): string {
-  if (!value) return '';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '';
-  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
-}
-
-export function reminderDate(value: string | null): string {
-  if (!value) return 'Not scheduled';
-  const date = new Date(value);
+export function formatEvidenceDate(value: string | null): string {
+  if (!value) return 'Not recorded';
+  const date = new Date(/(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? value : value + 'Z');
   return Number.isNaN(date.getTime()) ? 'Date unavailable' : date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 }
 
-export function workspaceRequestId(): string {
+export function newRequestId(): string {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -46,9 +36,6 @@ export function mergeLeadSnapshot(current: LeadResult | null, incoming: LeadResu
   return {
     ...research,
     reviewed: workflow.reviewed, tracking_notes: workflow.tracking_notes, tracking_version: workflow.tracking_version,
-    owner_id: workflow.owner_id, owner_name: workflow.owner_name, owner_active: workflow.owner_active,
-    follow_up_at: workflow.follow_up_at, follow_up_note: workflow.follow_up_note,
-    follow_up_completed_at: workflow.follow_up_completed_at, follow_up_status: workflow.follow_up_status,
     refresh_id: refresh.refresh_id, refresh_status: refresh.refresh_status,
     refresh_error: refresh.refresh_error, refresh_requested_at: refresh.refresh_requested_at,
   };

@@ -12,7 +12,7 @@ import { dash, num, safeArr, numVal } from '@/lib/format';
 import type { LeadResult } from '@/types';
 import { IcpEvidence, SourceGlobe } from './IcpEvidence';
 import { LeadTracking } from './LeadTracking';
-import { LeadWorkflow, LeadEvidenceRefresh } from './LeadWorkflow';
+import { LeadEvidenceRefresh } from './LeadEvidenceRefresh';
 
 export function LeadDetailDrawer({ lead, open, onClose, jobId, onSaved }: {
   jobId: string;
@@ -149,9 +149,6 @@ function LeadDetailContent({ lead, jobId, onSaved }: { lead: LeadResult; jobId: 
         <LeadTracking lead={lead} jobId={jobId} onSaved={onSaved} notes />
       </Section>
 
-      <Section icon={<User className="h-4 w-4" />} title="Ownership & follow-up">
-        <LeadWorkflow lead={lead} jobId={jobId} onSaved={onSaved} />
-      </Section>
 
       <Section icon={<Lightbulb className="h-4 w-4" />} title="AI Reasoning">
         <LeadEvidenceRefresh lead={lead} jobId={jobId} onSaved={onSaved} />

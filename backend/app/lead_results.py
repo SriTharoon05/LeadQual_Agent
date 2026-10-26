@@ -1,4 +1,4 @@
-"""Shared lead response and workflow dates for job and workspace views."""
+"""Shared job lead responses, reviewed state, notes and evidence dates."""
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -21,14 +21,6 @@ def utc(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
-def follow_up_status(tracking, now: datetime | None = None) -> str:
-    if not tracking or not tracking.follow_up_at:
-        return "unscheduled"
-    if tracking.follow_up_completed_at:
-        return "completed"
-    return "due" if utc(tracking.follow_up_at) <= utc(now or datetime.now(timezone.utc)) else "upcoming"
-
-
 def freshness(checked_at: datetime | None, now: datetime | None = None) -> tuple[str, int | None]:
     if not checked_at:
         return "unknown", None
@@ -42,13 +34,6 @@ class LeadResultResponse(BaseModel):
     reviewed: bool = False
     tracking_notes: str = ""
     tracking_version: int = 0
-    owner_id: str | None = None
-    owner_name: str | None = None
-    owner_active: bool | None = None
-    follow_up_at: datetime | None = None
-    follow_up_note: str = ""
-    follow_up_completed_at: datetime | None = None
-    follow_up_status: Literal["due", "upcoming", "completed", "unscheduled"] = "unscheduled"
     evidence_age_days: int | None = None
     evidence_status: Literal["fresh", "stale", "unknown"] = "unknown"
     refresh_status: Literal["queued", "running", "completed", "failed"] | None = None
@@ -118,7 +103,6 @@ def lead_to_response(lead: Lead, *, include_details=True, latest_refresh=_LATEST
     contact_data = saved_contact({"Email Address": lead.email_address, "Phone Number": lead.phone_number,
                                   "Direct Phone Number": lead.direct_phone_number},
                                  json_object(contact.raw_output) if contact else {}) if include_details else {}
-    owner = tracking.owner if tracking else None
     now = datetime.now(timezone.utc)
     evidence_status, age = freshness(lead.evidence_checked_at, now)
     if latest_refresh is _LATEST_UNSET:
@@ -131,13 +115,6 @@ def lead_to_response(lead: Lead, *, include_details=True, latest_refresh=_LATEST
         reviewed=bool(tracking.reviewed) if tracking else False,
         tracking_notes=(tracking.notes or "") if tracking else "",
         tracking_version=tracking.version if tracking else 0,
-        owner_id=str(tracking.owner_id) if tracking and tracking.owner_id else None,
-        owner_name=owner.name if owner else None,
-        owner_active=owner.active if owner else None,
-        follow_up_at=utc(tracking.follow_up_at) if tracking else None,
-        follow_up_note=(tracking.follow_up_note or "") if tracking else "",
-        follow_up_completed_at=utc(tracking.follow_up_completed_at) if tracking else None,
-        follow_up_status=follow_up_status(tracking, now),
         evidence_age_days=age, evidence_status=evidence_status,
         refresh_status=latest.status if latest else None,
         refresh_id=str(latest.id) if latest else None,

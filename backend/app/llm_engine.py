@@ -11,17 +11,20 @@ import logging
 import time
 from typing import Any, Optional
 
-from openai import AzureOpenAI
+from openai import OpenAI
 from app.config import settings
+from app.admin.billing import metered_call
 
 logger = logging.getLogger(__name__)
 
-_client = AzureOpenAI(
+_endpoint = settings.AZURE_OPENAI_ENDPOINT.rstrip("/")
+_responses_base = (_endpoint + "/" if _endpoint.endswith("/openai/v1") else
+                   _endpoint + "/v1/" if _endpoint.endswith("/openai") else _endpoint + "/openai/v1/")
+_client = OpenAI(
     api_key=settings.AZURE_OPENAI_API_KEY,
-    azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
-    api_version=settings.AZURE_OPENAI_API_VERSION,
+    base_url=_responses_base,  # Azure's stable v1 Responses API exposes tool_usage billing counters.
     timeout=settings.LLM_TIMEOUT_SECONDS,
-    max_retries=1,
+    max_retries=0,  # Every 429/attempt must be visible and metered; task retries own recovery.
 )
 
 _DEPLOYMENT = settings.AZURE_OPENAI_DEPLOYMENT
@@ -38,42 +41,6 @@ class TokenUsage:
         self.completion_tokens = completion or 0
         self.total_tokens = (prompt or 0) + (completion or 0)
         self.model = model or _DEPLOYMENT
-
-
-def _log_call(
-    usage: TokenUsage,
-    stage: str,
-    module: str,
-    duration_ms: int,
-    use_web_search: bool,
-    job_id: Optional[str],
-    lead_id: Optional[str],
-    web_search_calls: int = 0,
-) -> None:
-    """
-    Write one llm_call_logs row. Fires a tiny self-contained DB session
-    so it never interferes with the caller's open transaction.
-    Best-effort — never raises.
-    """
-    try:
-        from app.database import db_session
-        from app.models import LLMCallLog
-        with db_session() as db:
-            db.add(LLMCallLog(
-                job_id=job_id,
-                lead_id=lead_id,
-                stage=stage,
-                module=module,
-                prompt_tokens=usage.prompt_tokens,
-                completion_tokens=usage.completion_tokens,
-                total_tokens=usage.total_tokens,
-                model=usage.model,
-                duration_ms=duration_ms,
-                use_web_search=use_web_search,
-                web_search_calls=web_search_calls,
-            ))
-    except Exception as e:
-        logger.warning(f"[token_log] failed to write llm_call_log: {e}")
 
 
 # ── Core call ─────────────────────────────────────────────────────────────────
@@ -95,14 +62,14 @@ def _call(
 
     t0 = time.monotonic()
     try:
-        response = _client.responses.create(
-            model=_DEPLOYMENT,
-            input=prompt,
-            instructions=system,
-            tools=tools,
-            max_output_tokens=max_output_tokens,
-            include=["web_search_call.action.sources"] if use_web_search else [],
-        )
+        with metered_call(stage=stage, module=module, request_model=_DEPLOYMENT,
+                job_id=job_id, lead_id=lead_id, web=use_web_search) as meter:
+            response = _client.responses.create(
+                model=_DEPLOYMENT, input=prompt, instructions=system, tools=tools,
+                max_output_tokens=max_output_tokens,
+                include=["web_search_call.action.sources"] if use_web_search else [],
+            )
+            meter.response = response
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
         raise
@@ -163,8 +130,6 @@ def _call(
         f"web_searches={web_search_call_count}"
     )
 
-    _log_call(usage, stage, module, duration_ms, use_web_search, job_id, lead_id, web_search_call_count)
-
     return output_text.strip(), source_urls, usage
 
 # ── Public API (all now accept optional job_id/lead_id/stage) ─────────────────
@@ -208,7 +173,7 @@ def llm_json(
     try:
         return json.loads(clean)
     except json.JSONDecodeError as e:
-        logger.error(f"LLM returned invalid JSON: {e}\nRaw:\n{clean}")
+        logger.error("Model returned invalid JSON (line=%s column=%s)", e.lineno, e.colno)
         raise ValueError(f"LLM response was not valid JSON: {e}") from e
 
 
@@ -254,7 +219,7 @@ def llm_json_with_sources(
     try:
         return json.loads(clean), urls
     except json.JSONDecodeError as e:
-        logger.error(f"LLM (web) returned invalid JSON: {e}\nRaw:\n{clean}")
+        logger.error("Research model returned invalid JSON (line=%s column=%s)", e.lineno, e.colno)
         raise ValueError(f"LLM web response was not valid JSON: {e}") from e
 
 

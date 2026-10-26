@@ -1,12 +1,11 @@
 """
 utils/logger.py
 ───────────────
-Thin wrapper that writes structured entries to the processing_logs table
-AND emits to the standard Python logger simultaneously. (HARDENED edition)
+Thin pipeline wrapper around the standard Python logger.
+The root operational handler asynchronously persists only WARNING/ERROR.
 
 Design principle: logging must NEVER crash the pipeline. Every message is
-coerced to a safe non-empty string; DB write failures are swallowed; a missing
-DB session degrades to console-only logging.
+coerced to a safe non-empty string. Logging never enlists the lead transaction.
 
 Import pattern everywhere in the pipeline:
     from app.utils.logger import pipeline_logger
@@ -22,26 +21,21 @@ One-time setup (call once at worker/app startup):
 """
 
 import logging
-import traceback
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.database import SessionLocal, engine
-from app.models import ProcessingLog
+from app.admin.telemetry import set_context
 
 # Standard Python logger (goes to stdout / your log aggregator)
 _py_logger = logging.getLogger("ailead.pipeline")
 
-# Cap DB messages so a runaway payload can't bloat the table / hit column limits.
-MAX_DB_MESSAGE_CHARS = 20000
 
 
 # ── Safe string coercion ──────────────────────────────────────────────────────
 def _safe_str(message, default: str = "(empty log message)") -> str:
     """
-    Coerce ANY message to a non-empty string. Fixes the NOT-NULL crash when a
-    None or non-string message reaches ProcessingLog(message=...).
+    Coerce any message to a non-empty string.
     """
     if message is None:
         return default
@@ -85,7 +79,7 @@ def configure_logging(level: int = logging.INFO) -> None:
 
 class PipelineLogger:
     """
-    Thin dual-writer: Azure SQL processing_logs + Python logging.
+    Bind full operational context and emit pipeline messages.
     Instantiate once per task with the IDs you know at that point.
     """
 
@@ -98,6 +92,7 @@ class PipelineLogger:
         self._db = db
         self._job_id = job_id
         self._lead_id = lead_id
+        set_context(job_id=job_id, lead_id=lead_id)
 
     # ── Public methods ────────────────────────────────────────────────────────
     def info(self, message: str) -> None:
@@ -111,70 +106,24 @@ class PipelineLogger:
         _py_logger.warning(self._fmt(msg))
 
     def error(self, message: str, exc: Optional[Exception] = None) -> None:
-        # DB entry gets the full traceback; console stays clean (one-line reason).
         msg = _safe_str(message)
-        db_message = msg
-        console_message = msg
-
-        if exc is not None:
-            try:
-                tb = traceback.format_exc()
-            except Exception:
-                tb = ""
-            if tb and tb.strip() and tb.strip() != "NoneType: None":
-                db_message = f"{msg}\n{tb}"
-            console_message = f"{msg}: {exc}"
-
-        self._write("ERROR", db_message)
+        console_message = f"{msg}: {exc}" if exc is not None else msg
         _py_logger.error(self._fmt(console_message))
 
     # Allow updating IDs mid-task (e.g. after the lead row is inserted)
     def set_lead_id(self, lead_id: str) -> None:
         self._lead_id = lead_id
+        set_context(lead_id=lead_id)
 
     def set_job_id(self, job_id: str) -> None:
         self._job_id = job_id
+        set_context(job_id=job_id)
 
     # ── Internal ──────────────────────────────────────────────────────────────
     def _write(self, level: str, message: str) -> None:
-        # No DB session → console-only (still logged by the public methods).
-        if self._db is None:
-            return
-        try:
-            entry = ProcessingLog(
-                job_id=self._job_id,
-                lead_id=self._lead_id,
-                level=level,
-                message=_safe_str(message)[:MAX_DB_MESSAGE_CHARS],
-            )
-            # Never enlist logs in the business transaction. A flush here used
-            # to retain FK locks throughout DNS/AI waits and could leave the
-            # caller's Session unusable after a best-effort logging failure.
-            with engine.connect() as connection:
-                try:
-                    # A caller can still hold an uncommitted parent-row write.
-                    # Logging must not wait indefinitely for that same caller.
-                    connection.exec_driver_sql("SET LOCK_TIMEOUT 1000")
-                    connection.commit()
-                    with SessionLocal(bind=connection) as log_db:
-                        log_db.add(entry)
-                        log_db.commit()
-                finally:
-                    try:
-                        connection.rollback()
-                        # SQL Server SET options survive transaction rollback;
-                        # restore the default before returning this socket.
-                        connection.exec_driver_sql("SET LOCK_TIMEOUT -1")
-                        connection.commit()
-                    except Exception:
-                        connection.invalidate()
-                        raise
-        except Exception as e:
-            # Never let logging blow up the pipeline.
-            try:
-                _py_logger.error(f"Failed to write processing_log to DB: {e}")
-            except Exception:
-                pass
+        # Root OperationalHandler persists warnings/errors through its Redis
+        # outbox. INFO remains console-only; do not duplicate SQL log writes.
+        return
 
     def _fmt(self, message: str) -> str:
         parts = []

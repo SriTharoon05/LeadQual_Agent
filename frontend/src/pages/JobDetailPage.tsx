@@ -1,3 +1,4 @@
+import { LiveIssuePanel } from '@/components/LiveIssuePanel';
 import { lazy, Suspense, useState, useEffect, useRef } from 'react';
 import { useDebouncedValue } from '@/hooks/useDebouncedValue';
 import { useParams, Link, useNavigate } from 'react-router-dom';
@@ -10,8 +11,8 @@ import {
 } from 'lucide-react';
 import { TopBar } from '@/components/TopBar';
 import { LeadTracking } from '@/components/LeadTracking';
-import { EvidenceBadge, FollowUpBadge, OwnerBadge } from '@/components/LeadWorkflow';
-import { invalidateLeadWorkspace, mergeLeadSnapshot } from '@/lib/workspace';
+import { EvidenceBadge } from '@/components/LeadEvidenceRefresh';
+import { invalidateLeadData, mergeLeadSnapshot } from '@/lib/leadCache';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Badge, StatusBadge, PriorityBadge, ScoreChip } from '@/components/ui/Badge';
@@ -156,7 +157,7 @@ function JobDetailContent({ jobId }: { jobId: string }) {
       await deleteJob(jobId);
       toast('Job deleted', 'success');
       qc.invalidateQueries({ queryKey: ['jobs'] });
-      void invalidateLeadWorkspace(qc);
+      void invalidateLeadData(qc);
       navigate('/dashboard');
     } catch {
       toast('Failed to delete job', 'error');
@@ -201,6 +202,9 @@ function JobDetailContent({ jobId }: { jobId: string }) {
     <div className="min-h-screen bg-sky-gradient">
       <TopBar />
       <main className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+        <LiveIssuePanel jobId={jobId} />
+        <Link to={`/admin/cost/${jobId}`} className="inline-block text-sm font-medium text-brand-700 hover:underline">View job costs →</Link>
+
         {/* Back link */}
         <Link to="/dashboard" className="inline-flex items-center gap-1.5 text-sm text-slate-500 hover:text-brand-600 transition-colors">
           <ArrowLeft className="h-4 w-4" /> Back to Dashboard
@@ -359,7 +363,6 @@ function JobDetailContent({ jobId }: { jobId: string }) {
                       <Th onClick={() => toggleSort('final_score')}><span className="flex items-center gap-1">Score {sortIcon('final_score')}</span></Th>
                       <Th onClick={() => toggleSort('priority')}><span className="flex items-center gap-1">Priority {sortIcon('priority')}</span></Th>
                       <Th>Reviewed</Th>
-                      <Th>Owner / follow-up</Th>
                       <Th>Evidence</Th>
                       <Th>Notes / history</Th>
                     </tr>
@@ -378,7 +381,6 @@ function JobDetailContent({ jobId }: { jobId: string }) {
                         <td className="px-4 py-3"><ScoreChip score={lead.final_score} /></td>
                         <td className="px-4 py-3"><PriorityBadge priority={lead.priority} /></td>
                         <td className="px-4 py-3"><LeadTracking lead={lead} jobId={jobId} onSaved={trackingSaved} /></td>
-                        <td className="px-4 py-3"><div className="space-y-1"><OwnerBadge lead={lead} /><div><FollowUpBadge lead={lead} /></div></div></td>
                         <td className="px-4 py-3"><EvidenceBadge lead={lead} /></td>
                         <td className="px-4 py-3 max-w-[180px]">
                           <button type="button" onClick={(event) => { event.stopPropagation(); void openLead(lead); }}
@@ -410,7 +412,6 @@ function JobDetailContent({ jobId }: { jobId: string }) {
                       <button type="button" onClick={(event) => { event.stopPropagation(); void openLead(lead); }} className="text-brand-700 underline">{lead.tracking_notes ? 'View notes' : 'Add notes'}</button>
                       {lead.reuse_kind && <span className="text-sky-700">{lead.reuse_kind === 'full' ? 'Result reused' : 'Research reused'}</span>}
                     </div>
-                    <div className="mb-2 flex flex-wrap gap-2"><OwnerBadge lead={lead} /><FollowUpBadge lead={lead} /><EvidenceBadge lead={lead} /></div>
                     {lead.email_address && (
                       <div className="flex items-center gap-1 mt-1 text-xs text-slate-400">
                         <Mail className="h-3 w-3" /> {lead.email_address}

@@ -7,13 +7,14 @@ degrade to useful database answers instead of falsely claiming a job is empty.
 import json
 import logging
 import re
+from app.admin.billing import metered_call
 from datetime import datetime, timezone
 from time import monotonic
 
 from sqlalchemy.orm import Session
 
 from app.chat.entities import exact_mentions, heuristic_mentions, load_registry, normalized, resolve
-from app.chat.planning import CURRENCY_FILTER_VALUES, DISPLAY_FIELDS, QueryPlan, deterministic_plan, planner_prompt, validated_plan, workflow_filter_request
+from app.chat.planning import CURRENCY_FILTER_VALUES, DISPLAY_FIELDS, QueryPlan, deterministic_plan, planner_prompt, validated_plan
 from app.chat.retrieval import retrieve
 from app.config import settings
 
@@ -121,14 +122,16 @@ def _plan_with_model(message: str, history: list[dict], deterministic: QueryPlan
                "previous_context": previous, "deterministic_hint": deterministic.to_dict(),
                "current_time_utc": datetime.now(timezone.utc).isoformat(),
                "user_timezone": "unknown; clarify calendar-day questions if needed"}
-    response = _client().chat.completions.create(
-        model=settings.CHAT_DEPLOYMENT,
-        messages=[{"role": "system", "content": planner_prompt()},
-                  *_history_for_model(history),
-                  {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-        response_format={"type": "json_object"}, temperature=0,
-        max_completion_tokens=1600, timeout=PLANNER_TIMEOUT,
-    )
+    with metered_call(stage="chat_planner", module="chat", request_model=settings.CHAT_DEPLOYMENT) as meter:
+        response = _client().chat.completions.create(
+            model=settings.CHAT_DEPLOYMENT,
+            messages=[{"role": "system", "content": planner_prompt()},
+                      *_history_for_model(history),
+                      {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+            response_format={"type": "json_object"}, temperature=0,
+            max_completion_tokens=1600, timeout=PLANNER_TIMEOUT,
+        )
+        meter.response = response
     if not response.choices or not response.choices[0].message.content:
         raise PlanValidationError("empty_response")
     if response.choices[0].finish_reason == "length":
@@ -148,7 +151,7 @@ def _generic_help():
             "- **Find a record:** ‘Show row 500’ or ‘Email for Kaman Corporation’.\n"
             "- **Filter and compare:** ‘High-priority leads with email or phone’ or ‘Compare these companies’.\n"
             "- **Count and summarize:** ‘Average score by industry’ or ‘How many leads are unreviewed?’\n"
-            "- **Team workflow:** ‘Overdue follow-ups’, ‘Unassigned leads’, or ‘Who owns row 500?’\n"
+            "- **Tracking:** ‘Which leads are reviewed?’ or ‘Show notes for row 500’.\n"
             "- **Saved research:** ‘Which products does this company make?’ or ‘Show the evidence for current employment’.\n\n"
             "I search **every page** of this upload using SQL and saved vector/website evidence. "
             "If a name or question is ambiguous, I’ll ask before choosing. Research describes saved snapshots, not a new live web search.")
@@ -432,9 +435,8 @@ def _compose(message: str, history: list[dict], data: dict, plan: QueryPlan, tim
         "If proof is unavailable in an earlier result, explain that evidence is unavailable. "
         "Never silently substitute a misspelled or ambiguous company/person; only the supplied selected scope is authoritative. "
         "Do not override current data with old answers from history. Say a missing field is unavailable. "
-        "Workflow fields describe saved owner/reminder/freshness/refresh values; dates are UTC. "
-        "Ownership and reminders are internal workspace metadata, not facts supported by company web sources. "
-        "You cannot assign leads, edit or complete reminders, or start a refresh. Never claim you performed an action. "
+        "Reviewed state and notes are saved tracking metadata; evidence dates are UTC. "
+        "Assignments, reminders and saved groups are unavailable. You cannot edit records or start a refresh. "
         "Direct the user to the lead's workflow controls for those changes. "
         "Format every answer as clean Markdown: begin with a short bold answer/heading, then a compact table "
         "for lists, comparisons, metrics or field/value details. Use bold labels and short bullets for explanations, "
@@ -455,12 +457,14 @@ def _compose(message: str, history: list[dict], data: dict, plan: QueryPlan, tim
         "Offer ‘next’ only when has_more is true. Outreach wording must be clearly labelled as a draft grounded in these records."
     )
     payload = {"CURRENT_QUESTION": message, "CURRENT_DATABASE_DATA": _answer_payload(data, plan)}
-    response = _client().chat.completions.create(
-        model=settings.CHAT_DEPLOYMENT,
-        messages=[{"role": "system", "content": system}, *_history_for_model(history),
-                  {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-        temperature=0.1, max_completion_tokens=2200, timeout=timeout,
-    )
+    with metered_call(stage="chat_answer", module="chat", request_model=settings.CHAT_DEPLOYMENT) as meter:
+        response = _client().chat.completions.create(
+            model=settings.CHAT_DEPLOYMENT,
+            messages=[{"role": "system", "content": system}, *_history_for_model(history),
+                      {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+            temperature=0.1, max_completion_tokens=2200, timeout=timeout,
+        )
+        meter.response = response
     return (response.choices[0].message.content or "").strip()
 
 
@@ -526,13 +530,6 @@ def answer(db: Session, job_id: str, message: str, history: list[dict] | None = 
     if re.search(r"\b(?:last|final)\s+(?:row|record|lead)\b", effective_message, re.I) and not plan.row_numbers:
         plan.row_numbers = [max((item.get("row_number") or 0 for item in registry.by_id.values()), default=0)]
         plan.understood = True
-    if workflow_filter_request(effective_message, plan):
-        return _result(
-            "I can show a specific lead's saved owner, follow-up reminder, evidence freshness, and refresh status. "
-            "Use the Workspace filters to list or count leads by owner, reminder date/status, or evidence freshness. "
-            "For a saved-data answer here, ask ‘who owns row 500?’ or ‘show the follow-up for row 500’.",
-            "guard", context=previous,
-        )
     requested_id_match = re.search(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", effective_message, re.I)
     requested_id = requested_id_match.group(0).lower() if requested_id_match and not re.search(r"\b(?:crm|account id|contact id)\b", effective_message, re.I) else None
     if requested_id and requested_id not in registry.by_id:

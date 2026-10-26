@@ -142,7 +142,8 @@ def dispatch_job(self, job_id: str):
             with celery.producer_or_acquire() as producer:
                 for lead_id, _ in page:
                     process_lead.apply_async(args=[str(lead_id), job.icp_prompt],
-                        task_id="lead-" + str(lead_id), producer=producer, retry=False)
+                        task_id="lead-" + str(lead_id), producer=producer, retry=False,
+                        headers={"job_id": str(job_id)})
             job.dispatch_row_index, job.dispatch_lead_id = page[-1].row_index, page[-1].id
             job.dispatch_updated_at = _now()
         # Another short task advances the next page. SQL recovery also resumes

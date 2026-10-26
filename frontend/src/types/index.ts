@@ -73,13 +73,6 @@ export interface DashboardStatsResponse {
 
 // ── Lead ────────────────────────────────────────────────────────────────────
 export interface LeadResult {
-  owner_id: string | null;
-  owner_name: string | null;
-  owner_active: boolean | null;
-  follow_up_at: string | null;
-  follow_up_note: string;
-  follow_up_completed_at: string | null;
-  follow_up_status: 'due' | 'upcoming' | 'completed' | 'unscheduled';
   evidence_age_days: number | null;
   evidence_status: 'fresh' | 'stale' | 'unknown';
   refresh_status: 'queued' | 'running' | 'completed' | 'failed' | null;
@@ -117,59 +110,7 @@ export interface LeadResult {
   technologies_used: string | null;
 }
 
-// Shared workspace records are maintained independently of any uploaded file.
-export interface TeamMember {
-  id: string;
-  name: string;
-  email: string | null;
-  active: boolean;
-  version: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface LeadFilters {
-  search?: string;
-  priority?: Priority | null;
-  owner_id?: string | null;
-  unassigned?: boolean;
-  reviewed?: boolean | null;
-  follow_up?: 'all' | 'due' | 'upcoming' | 'completed' | 'unscheduled';
-  country?: string;
-  industry?: string;
-  min_score?: number | null;
-  evidence?: 'all' | 'fresh' | 'stale' | 'unknown';
-  job_id?: string | null;
-}
-
-export interface SavedSegment {
-  id: string;
-  name: string;
-  filters: LeadFilters;
-  version: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface WorkspaceLead extends LeadResult {
-  job_id: string;
-  file_name: string | null;
-  row_number: number | null;
-}
-
-export interface WorkspaceLeadPage {
-  items: WorkspaceLead[];
-  total: number;
-  limit: number;
-  offset: number;
-  returned: number;
-  has_more: boolean;
-}
-
-export interface ReminderPage extends WorkspaceLeadPage {
-  counts: { due: number; upcoming: number; completed: number };
-}
-
+// Shared reviewed state and notes are independent of uploads.
 export interface RefreshRun {
   id: string;
   lead_id: string;
@@ -185,10 +126,6 @@ export interface TrackingUpdate {
   version: number;
   reviewed?: boolean;
   notes?: string;
-  owner_id?: string | null;
-  follow_up_at?: string | null;
-  follow_up_note?: string;
-  follow_up_completed?: boolean;
 }
 
 export interface IcpProof {

@@ -17,6 +17,7 @@ import math
 from openai import AzureOpenAI
 
 from app.config import settings
+from app.admin.billing import metered_call
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ def chunk_text(text: str) -> list[str]:
 
 
 # ── Embedding ─────────────────────────────────────────────────────────────────
-def embed(texts: list[str]) -> list[list[float]]:
+def embed(texts: list[str], *, job_id=None, lead_id=None) -> list[list[float]]:
     """Batch-embed a list of strings → list of vectors (same order)."""
     if not texts:
         return []
@@ -73,10 +74,10 @@ def embed(texts: list[str]) -> list[list[float]]:
     out: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
         batch = texts[i:i + EMBED_BATCH]
-        resp = client.embeddings.create(
-            model=settings.EMBED_DEPLOYMENT,  
-            input=batch,
-        )
+        with metered_call(stage="embedding", module="vectorstore.embedder", kind="embedding",
+                request_model=settings.EMBED_DEPLOYMENT, job_id=job_id, lead_id=lead_id) as meter:
+            resp = client.embeddings.create(model=settings.EMBED_DEPLOYMENT, input=batch)
+            meter.response = resp
         out.extend(_validated_embeddings(resp.data, len(batch)))
     return out
 
@@ -101,7 +102,10 @@ def _validated_embeddings(data, count):
 def embed_one(text: str, *, timeout: float | None = None) -> list[float]:
     """Embed a single query string."""
     if timeout is not None and text and text.strip():
-        response = _client().with_options(timeout=timeout, max_retries=0).embeddings.create(
-            model=settings.EMBED_DEPLOYMENT, input=[text[:4000]])
+        with metered_call(stage="query_embedding", module="vectorstore.embedder", kind="embedding",
+                request_model=settings.EMBED_DEPLOYMENT) as meter:
+            response = _client().with_options(timeout=timeout, max_retries=0).embeddings.create(
+                model=settings.EMBED_DEPLOYMENT, input=[text[:4000]])
+            meter.response = response
         return _validated_embeddings(response.data, 1)[0]
     return embed([text])[0] if text and text.strip() else []

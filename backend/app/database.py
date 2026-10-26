@@ -26,9 +26,9 @@ engine = create_engine(
     settings.azure_sql_connection_string,
     poolclass=QueuePool,
     pool_size=10,
-    max_overflow=20,
+    max_overflow=30,             # 30 admission slots plus headroom for metering/settings queries
     pool_pre_ping=True,          # test connections before using them
-    pool_recycle=300,           # recycle connections every 30 min
+    pool_recycle=300,           # recycle connections every 5 min
     echo=(settings.LOG_LEVEL == "DEBUG"),
     use_insertmanyvalues=False,
     connect_args={
@@ -52,6 +52,12 @@ SessionLocal = sessionmaker(
     autoflush=False,
     expire_on_commit=False,   # safe for background Celery tasks
 )
+
+
+@event.listens_for(Session, "before_commit")
+def _fence_runtime_admission(session):
+    from app.admin.concurrency import assert_current_lease
+    assert_current_lease()
 
 
 # ── Base class for ORM models ─────────────────────────────────────────────────
@@ -298,6 +304,11 @@ def schema_ready() -> bool:
                     previous_snapshot_json FROM lead_refresh
             """))
             conn.execute(text("SELECT TOP 0 scoring_version, qualification_status, scoring_details_json, scoring_audit_json FROM final_scores"))
+            conn.execute(text("SELECT TOP 0 id, concurrency, pricing_json, usd_inr, fx_as_of, fx_source, version, updated_at, updated_by FROM runtime_settings"))
+            conn.execute(text("SELECT TOP 0 id, event_id, job_id, lead_id, severity, kind, stage, component, message, retry_after, occurred_at, created_at FROM operational_events"))
+            conn.execute(text("SELECT TOP 0 billing_model, cached_prompt_tokens, search_requests, status, error_code, provider_request_id, cost_input_usd, cost_cached_usd, cost_output_usd, cost_search_usd, cost_total_usd, cost_complete, pricing_snapshot_json FROM llm_call_logs"))
+            if conn.execute(text("SELECT TOP 1 id FROM runtime_settings WHERE id='runtime' AND concurrency BETWEEN 1 AND 30")).first() is None:
+                return False
             conn.execute(text("""
                 SELECT TOP 0 ingest_status, ingest_attempts, ingest_dispatched_at, ingest_error
                 FROM company_scrape

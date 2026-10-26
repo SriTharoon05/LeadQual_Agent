@@ -1,32 +1,15 @@
-"""
-celery_app.py
-─────────────
-Celery application singleton.  (HARDENED, production-grade edition)
+"""Celery queues with fixed execution capacity and SQL-controlled admission.
 
-Key production fixes vs. the original:
-  • ensure_collection() no longer runs at IMPORT time. Running it on import
-    meant that if Qdrant Cloud was briefly unreachable, importing this module
-    (which the API and EVERY worker do) would raise and take the whole app
-    down. It now runs on the worker-ready signal, wrapped so a Qdrant outage
-    degrades gracefully (RAG embed simply retries later) instead of crashing.
-  • worker_concurrency is set from settings.MAX_WORKERS, so the worker count
-    lives in .env and you never have to remember the --concurrency flag.
-  • Startup side-effects are guarded.
-
-Usage in tasks:
-    from app.celery_app import celery
-
-Start a worker (concurrency comes from MAX_WORKERS in .env):
-    celery -A app.celery_app.celery worker --loglevel=info -Q lead_processing
-
-    # Override concurrency ad-hoc if needed:
-    celery -A app.celery_app.celery worker -Q lead_processing --concurrency=50
+Start qualification workers with --pool=threads --concurrency=30. The global
+1..30 active-lead limit is saved through /admin/settings and enforced by Redis
+leases across replicas. MAX_WORKERS is a deprecated, unused environment field.
+Run imports, embeddings and exports in their dedicated queues.
 """
 
 import logging
 
 from celery import Celery
-from celery.signals import worker_ready
+from celery.signals import worker_ready, worker_process_init, worker_process_shutdown, worker_shutdown, task_prerun, task_postrun
 
 from app.config import settings, CELERY_QUEUE_NAME
 
@@ -54,11 +37,10 @@ celery = Celery(
              "app.tasks.refresh_task", "app.tasks.export_task", "app.tasks.dispatch_task"],
 )
 
-# Concurrency from .env (MAX_WORKERS). CLI --concurrency still overrides this.
-try:
-    _concurrency = int(getattr(settings, "MAX_WORKERS", 10) or 10)
-except Exception:
-    _concurrency = 10
+# Execution capacity is fixed. SQL runtime_settings controls the global count of
+# active lead tasks through renewable admission leases, including across replicas.
+# MAX_WORKERS is retained as an unused legacy environment field.
+_concurrency = 30
 
 celery.conf.update(
     # Serialisation
@@ -82,7 +64,7 @@ celery.conf.update(
 
     # Worker behaviour — threads pool suits this I/O-bound pipeline.
     worker_pool="threads",
-    worker_concurrency=_concurrency,     # ← from MAX_WORKERS (.env)
+    worker_concurrency=_concurrency,
     worker_max_tasks_per_child=200,      # recycle after 200 tasks (memory hygiene)
     task_acks_late=True,                 # ack only after task completes
     task_reject_on_worker_lost=True,     # requeue if worker dies mid-task
@@ -98,6 +80,58 @@ celery.conf.update(
     broker_connection_timeout=5,
     broker_transport_options={"socket_connect_timeout": 5, "socket_timeout": 5},
 )
+
+
+@worker_process_init.connect
+def _operations_child(**_kwargs):
+    from app.admin.telemetry import configure_telemetry
+    configure_telemetry()
+
+
+@task_prerun.connect
+def _operations_task_start(**kwargs):
+    from app.admin.telemetry import task_context
+    task_context(**kwargs)
+
+
+@task_postrun.connect
+def _operations_task_end(**_kwargs):
+    from app.admin.telemetry import clear_context
+    from app.utils.monitor import clear_context as clear_monitor
+    clear_context()
+    clear_monitor()
+
+
+@worker_shutdown.connect
+@worker_process_shutdown.connect
+def _operations_stop(**_kwargs):
+    from app.admin.telemetry import flush_events
+    flush_events()
+
+
+@worker_ready.connect
+def _operations_start(sender=None, **_kwargs):
+    import json
+    import threading
+    from app.admin.settings import redis_client
+    from app.admin.telemetry import configure_telemetry
+    configure_telemetry()
+    queues = getattr(getattr(sender, "task_consumer", None), "queues", ())
+    if CELERY_QUEUE_NAME not in {queue.name for queue in queues}:
+        return
+    pool = getattr(sender, "pool", None)
+    pool_name = type(pool).__module__
+    capacity = 1 if "solo" in pool_name else int(getattr(pool, "limit", 0) or 0)
+    hostname = str(getattr(sender, "hostname", "worker"))
+    def heartbeat():
+        while True:
+            try:
+                redis_client().set("ql:runtime:worker:" + hostname,
+                    json.dumps({"hostname": hostname, "pool": pool_name, "capacity": capacity}), ex=35)
+            except Exception:
+                pass
+            threading.Event().wait(10)
+    threading.Thread(target=heartbeat, name="runtime-capacity", daemon=True).start()
 
 
 # ── Qdrant bootstrap — on worker startup, NOT on import ───────────────────────

@@ -11,7 +11,6 @@ import type {
   ChatMessage,
   ChatRequest,
   DashboardStatsResponse,
-  TeamMember, SavedSegment, LeadFilters, WorkspaceLeadPage, ReminderPage,
   RefreshRun, TrackingUpdate,
 } from '@/types';
 
@@ -135,57 +134,7 @@ export const updateLeadTracking = async (
   return data;
 };
 
-// ── Shared team workspace ──────────────────────────────────────────────────
-export const getTeam = async (): Promise<TeamMember[]> => {
-  const { data } = await apiClient.get<TeamMember[]>('/workspace/team', { params: { include_inactive: true } });
-  return data;
-};
-
-export const createTeamMember = async (values: { name: string; email: string | null }): Promise<TeamMember> => {
-  const { data } = await apiClient.post<TeamMember>('/workspace/team', values);
-  return data;
-};
-
-export const updateTeamMember = async (id: string, changes: { version: number; name?: string; email?: string | null; active?: boolean }): Promise<TeamMember> => {
-  const { data } = await apiClient.patch<TeamMember>(`/workspace/team/${id}`, changes);
-  return data;
-};
-
-export const getSegments = async (): Promise<SavedSegment[]> => {
-  const { data } = await apiClient.get<SavedSegment[]>('/workspace/segments');
-  return data;
-};
-
-export const createSegment = async (name: string, filters: LeadFilters): Promise<SavedSegment> => {
-  const { data } = await apiClient.post<SavedSegment>('/workspace/segments', { name, filters });
-  return data;
-};
-
-export const updateSegment = async (id: string, version: number, name: string, filters: LeadFilters): Promise<SavedSegment> => {
-  const { data } = await apiClient.patch<SavedSegment>(`/workspace/segments/${id}`, { version, name, filters });
-  return data;
-};
-
-export const deleteSegment = async (id: string, version: number): Promise<void> => {
-  await apiClient.delete(`/workspace/segments/${id}`, { params: { version } });
-};
-
-export const getWorkspaceLeads = async (filters: LeadFilters, offset = 0, limit = 50, segmentId?: string, signal?: AbortSignal): Promise<WorkspaceLeadPage> => {
-  const { data } = await apiClient.get<WorkspaceLeadPage>('/workspace/leads', {
-    params: { ...(segmentId ? { segment_id: segmentId } : filters), offset, limit, details: false },
-    signal,
-  });
-  return data;
-};
-
-export const getReminders = async (status: 'all' | 'due' | 'upcoming' | 'completed', offset = 0, limit = 10, ownerId?: string, signal?: AbortSignal): Promise<ReminderPage> => {
-  const { data } = await apiClient.get<ReminderPage & { due_count?: number; upcoming_count?: number; completed_count?: number }>('/workspace/reminders', {
-    params: { status, offset, limit, owner_id: ownerId || undefined, details: false },
-    signal,
-  });
-  return { ...data, counts: data.counts || { due: data.due_count || 0, upcoming: data.upcoming_count || 0, completed: data.completed_count || 0 } };
-};
-
+// ── Evidence refresh ──────────────────────────────────────────────────
 export const refreshLead = async (jobId: string, leadId: string, requestId: string): Promise<RefreshRun> => {
   const { data } = await apiClient.post<RefreshRun>(`/jobs/${jobId}/results/${leadId}/refresh`, { request_id: requestId });
   return data;

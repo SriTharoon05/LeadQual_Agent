@@ -185,6 +185,8 @@ def ingest_company(self, scrape_id):
             company, website = _s(lead.company_name), _s(lead.company_website)
             description, technologies = _s(lead.company_description), _s(lead.technologies_used)
             job_id = str(lead.job_id)
+            from app.admin.telemetry import set_context
+            set_context(job_id=job_id, lead_id=lead_id, stage="website_ingestion")
             db.commit()
             try:
                 research = research_company(company, website)
@@ -238,12 +240,14 @@ def embed_company(self, scrape_id):
                 return
             text, company = _s(row.clean_text), _s(row.company_name) or "Unknown"
             job_id, website, observed_at = str(row.job_id), _s(row.website_url), row.scraped_at
+            from app.admin.telemetry import set_context
+            set_context(job_id=job_id, lead_id=lead_id, stage="embedding")
             db.commit()  # No database transaction remains open across network waits.
             try:
                 chunks = chunk_text(text)
                 if not chunks:
                     raise ValueError("The saved document has no indexable text")
-                vectors = embed(chunks)
+                vectors = embed(chunks, job_id=job_id, lead_id=lead_id)
                 if len(vectors) != len(chunks):
                     raise ValueError("Embedding response did not match the complete document")
                 written = upsert_chunks(job_id=job_id, lead_id=lead_id, company_name=company,

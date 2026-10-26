@@ -1,5 +1,9 @@
 # Team workflow and evidence refresh
 
+> Historical release. Team profiles, assignments, reminders, groups and the
+> lead workspace were removed in [admin operations](RELEASE_ADMIN_OPERATIONS.md).
+> Retain this migration prerequisite for the evidence-refresh schema.
+
 The dashboard now has a team directory and follow-up reminders. The **Leads**
 navigation opens a workspace across all uploads. Open any lead's details to
 assign an owner, schedule a follow-up, maintain notes, or refresh its research.

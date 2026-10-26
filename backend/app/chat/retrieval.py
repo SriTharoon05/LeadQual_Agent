@@ -6,8 +6,8 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import Date, Float, Integer, UnicodeText, case, cast, func, literal_column, or_, and_, select
 from sqlalchemy.orm import aliased, joinedload, selectinload, noload, load_only
 
-from app.models import CompanyScrape, FinalScore, Job, Lead, LeadRefresh, LeadTracking, TeamMember, ValidationResult
-from app.lead_results import follow_up_status, freshness, utc
+from app.models import CompanyScrape, FinalScore, Job, Lead, LeadRefresh, LeadTracking, ValidationResult
+from app.lead_results import freshness, utc
 from app.utils.lead_identity import json_object
 from app.validators.evidence import citation_key, clean_sources, proof_rows, safe_url
 from app.validators.contact_policy import saved_contact
@@ -56,17 +56,6 @@ def column_for(name: str, numeric: bool = False):
         return func.coalesce(LeadTracking.reviewed, False)
     if name == "tracking_notes":
         return cast(LeadTracking.notes, UnicodeText)
-    if name == "owner_name":
-        return TeamMember.name
-    if name == "owner_active":
-        return TeamMember.active
-    if name in {"follow_up_at", "follow_up_completed_at", "follow_up_note"}:
-        column = getattr(LeadTracking, name)
-        return cast(column, UnicodeText) if name == "follow_up_note" else column
-    if name == "follow_up_status":
-        return case((LeadTracking.follow_up_at.is_(None), "unscheduled"),
-                    (LeadTracking.follow_up_completed_at.isnot(None), "completed"),
-                    (LeadTracking.follow_up_at <= datetime.now(timezone.utc).replace(tzinfo=None), "due"), else_="upcoming")
     if name == "evidence_checked_at":
         return Lead.evidence_checked_at
     if name == "evidence_age_days":
@@ -117,15 +106,13 @@ def _predicate(item: dict):
     column = column_for(name, numeric=operator in {"gt", "gte", "lt", "lte"}
                         or isinstance(value, (int, float)) and not isinstance(value, bool))
     if operator in {"is_missing", "is_present"}:
-        if name == "owner_name":
-            missing = LeadTracking.owner_id.is_(None)
-        elif name == "phone_number":
+        if name == "phone_number":
             missing = and_(_missing_contact(Lead.phone_number), _missing_contact(Lead.direct_phone_number))
         elif name in {"email_address", "direct_phone_number", "hq_phone_number"}:
             missing = _missing_contact(column)
         elif name == "tracking_notes":
             missing = _missing(cast(LeadTracking.notes, UnicodeText))
-        elif name in {"total_score", "icp_score", "growth_score", "contact_score", "row_number", "reviewed", "owner_active", "evidence_age_days"} | DATE_FIELDS:
+        elif name in {"total_score", "icp_score", "growth_score", "contact_score", "row_number", "reviewed", "evidence_age_days"} | DATE_FIELDS:
             missing = column.is_(None)
         else:
             missing = _missing(column)
@@ -164,18 +151,11 @@ def _record(lead: Lead, icp_input: str | None, fields=None, refresh_status=None,
                    "tracking_notes": _bounded(tracking.notes) if tracking else None,
                    "icp_input": _bounded(icp_input, 3000)})
     now = datetime.now(timezone.utc)
-    owner = tracking.owner if tracking else None
     evidence_status, evidence_age = freshness(lead.evidence_checked_at, now)
     runs = (lead.refresh_requests or []) if refresh_status is None else []
     active_refresh = next((run for run in runs if run.status in {"queued", "running"}), None)
     latest_refresh = active_refresh or next(iter(runs), None)
     result.update({
-        "owner_name": _bounded(owner.name) if owner else "Unassigned",
-        "owner_active": bool(owner.active) if owner else None,
-        "follow_up_at": _date(tracking.follow_up_at) if tracking else None,
-        "follow_up_note": _bounded(tracking.follow_up_note) if tracking else None,
-        "follow_up_completed_at": _date(tracking.follow_up_completed_at) if tracking else None,
-        "follow_up_status": follow_up_status(tracking, now),
         "evidence_checked_at": _date(lead.evidence_checked_at),
         "evidence_age_days": evidence_age, "evidence_status": evidence_status,
         "refresh_status": refresh_status if refresh_status is not None else latest_refresh.status if latest_refresh else "Not requested",
@@ -267,7 +247,6 @@ def base_query(db, job_id: str, plan: QueryPlan, scope: dict):
     """One mandatory scope/compiler shared by records, aggregates and evidence."""
     query = (db.query(Lead).outerjoin(FinalScore, FinalScore.lead_id == Lead.id)
              .outerjoin(LeadTracking, LeadTracking.id == Lead.tracking_id)
-             .outerjoin(TeamMember, TeamMember.id == LeadTracking.owner_id)
              .filter(Lead.job_id == job_id))
     if scope.get("companies"):
         query = query.filter(Lead.company_name.in_(scope["companies"]))
