@@ -118,6 +118,18 @@ export function UploadPage() {
         setStep('select');
         return;
       }
+      const response = isAxiosError(cause) ? cause.response : undefined;
+      const code = response?.status;
+      if (code != null && code >= 400 && code < 500 && code !== 408 && code !== 429) {
+        // An explicit rejection did not accept this transfer. Recovery is for
+        // ambiguous timeouts/server failures, not a proxy's size-limit response.
+        const detail = response?.data?.detail;
+        toast(typeof detail === 'string' ? detail : code === 413
+          ? 'This file exceeds the server upload limit. Try a smaller file or ask your administrator to increase the limit.'
+          : 'The upload was rejected. Check the file and your sign-in status, then try again.', 'error');
+        setStep('select');
+        return;
+      }
       try {
         const current = await getJobStatus(requestId);
         if (!current.upload_pending && current.status !== 'import_failed') {

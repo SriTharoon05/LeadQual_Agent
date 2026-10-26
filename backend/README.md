@@ -1,5 +1,8 @@
 # Quality Lead API and workers
 
+For uploads that work locally but return HTTP 413 in Azure, see
+[the proxy upload-limit fix and deployment steps](RELEASE_UPLOAD_LIMIT.md).
+
 For per-upload **Reuse saved research / Fresh AI research** options and the
 required schema upgrade, see [the processing modes guide](RELEASE_PROCESSING_MODES.md).
 
