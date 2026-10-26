@@ -92,8 +92,10 @@ def db_session() -> Generator[Session, None, None]:
     except Retry:
         db.rollback()
         raise
-    except Exception as e:
-        logger.error(f"db_session commit failed, rolling back: {e}", exc_info=True)
+    except Exception:
+        # The exception may have come from a query inside yield, not commit.
+        # Callers own the diagnostic/retry policy; logging it here duplicated
+        # every recovery traceback and exposed raw connection diagnostics.
         db.rollback()
         raise
     finally:

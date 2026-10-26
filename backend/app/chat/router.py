@@ -26,6 +26,10 @@ _GREETING_RE = re.compile(r"^\s*(hi|hii+|hey|hello|yo|help|start|\?|hola)\s*[!.?
 _llm = None
 
 
+class PlanValidationError(ValueError):
+    """A safe rejection category; never contains model output or saved data."""
+
+
 def _client():
     global _llm
     if _llm is None:
@@ -125,9 +129,17 @@ def _plan_with_model(message: str, history: list[dict], deterministic: QueryPlan
         response_format={"type": "json_object"}, temperature=0,
         max_completion_tokens=1600, timeout=PLANNER_TIMEOUT,
     )
-    plan = validated_plan(json.loads(response.choices[0].message.content or ""))
+    if not response.choices or not response.choices[0].message.content:
+        raise PlanValidationError("empty_response")
+    if response.choices[0].finish_reason == "length":
+        raise PlanValidationError("truncated_response")
+    try:
+        raw = json.loads(response.choices[0].message.content)
+    except (ValueError, TypeError):
+        raise PlanValidationError("invalid_json") from None
+    plan = validated_plan(raw)
     if plan is None:
-        raise ValueError("Assistant returned an unsupported query plan")
+        raise PlanValidationError("unsupported_plan")
     return plan
 
 
@@ -563,7 +575,7 @@ def answer(db: Session, job_id: str, message: str, history: list[dict] | None = 
                         old_names = {normalized(name) for name in previous.get("companies", [])}
                         old_names.add(normalized(previous.get("person", "")))
                         if literal not in old_names:
-                            raise ValueError("Planner substituted a nonliteral name")
+                            raise PlanValidationError("nonliteral_name")
                 planned.entities = [entity for entity in planned.entities if re.search(
                     rf"(?<!\w){re.escape(normalized(entity['value']))}(?!\w)", normalized(effective_message))]
                 plan = planned
@@ -572,6 +584,12 @@ def answer(db: Session, job_id: str, message: str, history: list[dict] | None = 
                 return _clarification_result(
                     planned.clarification_question or "Which company/contact or row and which detail should I inspect? I can search saved SQL fields and website/vector research; a live update requires the lead's refresh control.",
                     [], effective_message, previous)
+        except PlanValidationError as exc:
+            logger.warning("Chat plan rejected (job=%s, reason=%s)", job_id, exc)
+            return _clarification_result(
+                "I couldn't safely interpret that request. Which company, contact or original row do you mean, "
+                "and which details or comparison would you like?",
+                [], effective_message, previous, degraded=True)
         except Exception as exc:
             degraded = True
             logger.warning("Chat planner unavailable (job=%s, type=%s)", job_id, type(exc).__name__)

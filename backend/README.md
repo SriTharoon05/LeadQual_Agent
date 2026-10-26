@@ -46,6 +46,29 @@ client IP reported in the error (start and end IP equal), or use your organizati
 approved private-network connection. Wait up to five minutes and retry. API database
 connection failures return HTTP 503; a code update does not grant firewall access.
 
+The chatbot's SQL Server ordering fix is separate from the dashboard ordering
+fix: lead and company queries now add each sort/tie-break column once, preserving
+stable paging without SQL error 169. Planner responses use explicit defaults for
+unused options; valid clarification questions are preserved instead of being
+reported as model outages. Invalid plans stay rejected and never broaden a query.
+
+Workers back off recovery scans during database outages (roughly one to five
+minutes, with jitter), log concise rate-limited diagnostics, and resume polling
+after access returns. Qualification connection errors do not spend the separate
+research-error retry budget or mark leads failed. A programming error such as an
+invalid SQL query remains an application error rather than being called a network
+outage. Restart the API and **all Celery workers** after updating this code; these
+fixes add no database migration. Previously documented migrations still apply.
+
+The ODBC 17 connection URL no longer passes the unsupported SqlClient
+`Connection Timeout` keyword. The existing `pyodbc.connect(timeout=30)` argument
+sets the login timeout. See Microsoft's
+[ODBC keyword reference](https://learn.microsoft.com/en-us/sql/connect/odbc/dsn-connection-string-attribute).
+Encryption and certificate verification remain enabled.
+
+For these fixes, verification was limited to source/diff review at the user's
+request. No tests, builds, application imports or live Azure/SQL checks were run.
+
 See `../dev.md` for local setup, `../read.md` for the end-to-end design, and `../AZURE_DEPLOYMENT.md` for production deployment.
 
 docker local run commands

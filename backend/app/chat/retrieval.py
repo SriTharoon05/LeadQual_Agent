@@ -348,8 +348,13 @@ def retrieve(db, job_id: str, plan: QueryPlan, scope: dict) -> dict:
                    .group_by(Lead.company_name))
         context["matched_count_companies"] = grouped.count()
         order = func.avg(column_for(plan.sort_by)) if plan.sort_by in SCORE_FIELDS else Lead.company_name
-        grouped = grouped.order_by(case((order.is_(None), 1), else_=0),
-                                   order.desc() if plan.direction == "desc" else order.asc(), Lead.company_name.asc())
+        ordering = [case((order.is_(None), 1), else_=0),
+                    order.desc() if plan.direction == "desc" else order.asc()]
+        # Alphabetical ordering already contains the unique grouping key.
+        # SQL Server rejects the same column twice, even with opposite directions.
+        if plan.sort_by in SCORE_FIELDS:
+            ordering.append(Lead.company_name.asc())
+        grouped = grouped.order_by(*ordering)
         context["companies"] = [{"company_name": name, "lead_count": count,
                                   "average_score": round(float(average), 2) if average is not None else None,
                                   "highest_score": highest, "ranking_metric": ranking_metric,
@@ -368,15 +373,24 @@ def retrieve(db, job_id: str, plan: QueryPlan, scope: dict) -> dict:
             "unique_companies": query.filter(Lead.company_name.isnot(None), func.ltrim(func.rtrim(Lead.company_name)) != "").with_entities(func.count(func.distinct(Lead.company_name))).scalar() or 0,
         }
         return context
-    order = column_for(plan.sort_by, numeric=plan.sort_by in {"employee_count", "annual_revenue"})
+    # Adding one to an original row index changes its display, not its order.
+    # Sort the column directly and do not append it again as a tie breaker.
+    order = Lead.row_index if plan.sort_by == "row_number" else column_for(
+        plan.sort_by, numeric=plan.sort_by in {"employee_count", "annual_revenue"})
     if plan.sort_by == "priority":
         order = case((FinalScore.priority == "High", 3), (FinalScore.priority == "Medium", 2), (FinalScore.priority == "Low", 1), else_=0)
+    ordering = [case((order.is_(None), 1), else_=0),
+                order.desc() if plan.direction == "desc" else order.asc()]
+    if plan.sort_by == "priority":
+        ordering.append(FinalScore.total_score.desc())
+    if plan.sort_by != "row_number":
+        ordering.append(Lead.row_index.asc())
+    ordering.append(Lead.id.asc())
     leads = (query.enable_eagerloads(True)
              .options(selectinload(Lead.final_score).load_only(*(getattr(FinalScore, field) for field in SCORE_FIELDS)), selectinload(Lead.validation_results),
                       noload(Lead.company_scrape), selectinload(Lead.tracking),
                       noload(Lead.refresh_requests))
-             .order_by(case((order.is_(None), 1), else_=0), order.desc() if plan.direction == "desc" else order.asc(),
-                       FinalScore.total_score.desc() if plan.sort_by == "priority" else Lead.row_index.asc(), Lead.row_index.asc(), Lead.id.asc())
+             .order_by(*ordering)
              .offset(plan.offset).limit(plan.limit).all())
     icp_input = db.query(Job.icp_prompt).filter(Job.id == job_id).scalar()
     refreshes = latest_refreshes(db, [lead.id for lead in leads])

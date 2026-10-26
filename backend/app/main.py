@@ -36,10 +36,11 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import case, event, func, or_, update
 from sqlalchemy.orm import Session, joinedload, selectinload, load_only, noload
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, TimeoutError as SQLAlchemyTimeoutError
 
 from app.config import settings, SUPPORTED_EXTENSIONS
 from app.database import get_db, ping_db, schema_ready
+from app.utils.db_availability import database_unavailable_reason, warn_database_unavailable
 from app.models import (Job, Lead, FinalScore, AdminUser, LeadTracking, TeamMember, LeadRefresh,
                         ProcessingLog, LLMCallLog, ValidationResult, ChatConversation, ChatMessage)
 from app.lead_results import LeadResultResponse, latest_refreshes, lead_to_response as _lead_to_response
@@ -83,17 +84,16 @@ app.add_middleware(
 
 
 @app.exception_handler(DBAPIError)
-async def database_error_handler(request: Request, exc: DBAPIError):
+@app.exception_handler(SQLAlchemyTimeoutError)
+async def database_error_handler(request: Request, exc: DBAPIError | SQLAlchemyTimeoutError):
     # Driver messages may contain infrastructure details; keep them in server logs.
-    logger.error("Database request failed", exc_info=exc)
-    args = getattr(exc.orig, "args", ())
-    sqlstate = str(args[0]) if args else ""
-    unavailable = (exc.connection_invalidated or sqlstate.startswith("08")
-                   or sqlstate in {"HYT00", "HYT01"} or "(40615)" in str(exc.orig))
-    if unavailable:
-        return JSONResponse(status_code=503, content={
+    reason = database_unavailable_reason(exc)
+    if reason:
+        warn_database_unavailable(logger, "API database request", exc)
+        return JSONResponse(status_code=503, headers={"Retry-After": "5"}, content={
             "detail": "Database unavailable. Check database connectivity and Azure SQL firewall access."
         })
+    logger.error("Database request failed", exc_info=exc)
     return JSONResponse(status_code=500, content={"detail": "Database request failed."})
 
 

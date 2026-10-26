@@ -17,6 +17,9 @@ from app.database import db_session, locked_lead_session
 from app.models import Job, Lead, ValidationResult, FinalScore
 from app.utils.lead_identity import reusable_lead, copy_result, json_object
 from app.utils.logger import pipeline_logger
+from app.utils.db_availability import (
+    database_retry_delay, database_unavailable_reason, warn_database_unavailable,
+)
 from app.utils.company_logger import CompanyLogger
 
 from app.validators.icp_validator import ICPResult, validate_icp
@@ -122,13 +125,30 @@ def process_lead(self, lead_id: str, icp_prompt: str):
         # Contention does not consume the separate processing-error budget.
         raise self.retry(exc=exc, countdown=30, max_retries=self.request.retries + 1)
     except Exception as exc:
+        if database_unavailable_reason(exc):
+            # Infrastructure access failures do not describe the lead and must
+            # never spend the paid-processing budget or mark it failed later.
+            warn_database_unavailable(logger, "Lead qualification", exc)
+            raise self.retry(
+                countdown=database_retry_delay(self.request.retries),
+                max_retries=self.request.retries + 1,
+            )
         headers = dict(self.request.headers or {})
         failures = int(headers.get("pipeline_failures", 0))
         if failures >= 3:
-            with locked_lead_session(lead_id) as db:
-                lead = db.get(Lead, lead_id)
-                if lead:
-                    _mark_lead_finished(db, lead, failed=True)
+            try:
+                with locked_lead_session(lead_id) as db:
+                    lead = db.get(Lead, lead_id)
+                    if lead:
+                        _mark_lead_finished(db, lead, failed=True)
+            except Exception as finish_error:
+                if not database_unavailable_reason(finish_error):
+                    raise
+                warn_database_unavailable(logger, "Lead qualification", finish_error)
+                raise self.retry(
+                    countdown=database_retry_delay(self.request.retries),
+                    max_retries=self.request.retries + 1,
+                )
             return
         headers["pipeline_failures"] = failures + 1
         raise self.retry(exc=exc, headers=headers, countdown=30,
@@ -141,6 +161,8 @@ def _process_lead(self, db, lead_id, icp_prompt):
     try:
         lead: Lead = db.query(Lead).filter(Lead.id == lead_id).first()
     except Exception as e:
+        if database_unavailable_reason(e):
+            raise
         log.error(f"Failed to load lead {lead_id}: {e}")
         raise
     if not lead:
@@ -344,6 +366,8 @@ def _process_lead(self, db, lead_id, icp_prompt):
         _mark_lead_finished(db, lead, failed=False)
 
     except Exception as exc:
+        if database_unavailable_reason(exc):
+            raise  # The outer task logs/backoffs; do not try writing a DB log.
         log.error(f"Pipeline error for {lead_id}: {exc}")
         try:
             clog.error("Pipeline error", exc=exc)
@@ -498,6 +522,8 @@ def _save_validation(
             db.add(vr)
         db.flush()
     except Exception as e:
+        if database_unavailable_reason(e):
+            raise
         logger.warning(f"_save_validation({stage}) failed for {lead_id}: {e}")
         raise
 

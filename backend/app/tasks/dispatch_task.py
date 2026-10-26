@@ -17,6 +17,10 @@ from app.celery_app import celery
 from app.config import settings
 from app.database import db_session
 from app.models import Job, Lead
+from app.utils.db_availability import (
+    RecoveryBackoff, database_retry_delay, database_unavailable_reason,
+    warn_database_unavailable,
+)
 from app.utils.lead_identity import transaction_lock
 
 logger = logging.getLogger(__name__)
@@ -146,6 +150,12 @@ def dispatch_job(self, job_id: str):
         dispatch_job.apply_async(args=[job_id], task_id="dispatch-" + job_id,
             queue=settings.CELERY_IMPORT_QUEUE, retry=False)
     except Exception as exc:
+        if database_unavailable_reason(exc):
+            warn_database_unavailable(logger, "Job page dispatch", exc)
+            raise self.retry(
+                countdown=database_retry_delay(self.request.retries),
+                max_retries=self.request.retries + 1,
+            )
         logger.exception("Could not publish job page %s", job_id)
         raise self.retry(exc=exc, countdown=15)
 
@@ -170,7 +180,9 @@ def _recover_job_requests():
             return
         try:
             request_dispatch(job_id)
-        except Exception:
+        except Exception as exc:
+            if database_unavailable_reason(exc):
+                raise  # Stop the page; the outer recovery loop owns backoff.
             logger.exception("Could not recover committed job %s", job_id)
 
 
@@ -188,19 +200,25 @@ def recover_jobs(sender=None, **_kwargs):
     _stop.clear()
 
     def recover():
+        imports = RecoveryBackoff("Job publication recovery", logger)
+        documents = RecoveryBackoff("Document ingestion recovery", logger)
         while not _stop.is_set():
-            if recover_imports:
+            if recover_imports and imports.ready():
                 try:
                     _recover_job_requests()
-                except Exception:
-                    logger.exception("Job publication recovery scan failed")
-            if recover_documents:
+                except Exception as exc:
+                    imports.failed(exc)
+                else:
+                    imports.succeeded()
+            if recover_documents and documents.ready():
                 try:
                     from app.tasks.embed_task import recover_ingestion_requests
                     recover_ingestion_requests()
-                except Exception:
-                    logger.exception("Document ingestion recovery scan failed")
-            if _stop.wait(15):
+                except Exception as exc:
+                    documents.failed(exc)
+                else:
+                    documents.succeeded()
+            if _stop.wait(5):
                 return
     _thread = threading.Thread(target=recover, name="job-dispatch-recovery", daemon=True)
     _thread.start()

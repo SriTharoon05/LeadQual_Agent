@@ -79,7 +79,9 @@ class Settings(BaseSettings):
             f"mssql+pyodbc://{quote_plus(self.AZURE_SQL_USERNAME)}:{quote_plus(self.AZURE_SQL_PASSWORD)}"
             f"@{self.AZURE_SQL_SERVER}/{quote_plus(self.AZURE_SQL_DATABASE)}"
             f"?driver={self.AZURE_SQL_DRIVER.replace(' ', '+')}"
-            f"&Encrypt=yes&TrustServerCertificate=no&Connection+Timeout=30"
+            # ODBC 17 does not accept the SqlClient "Connection Timeout" keyword.
+            # database.py sets the login timeout through pyodbc's timeout argument.
+            f"&Encrypt=yes&TrustServerCertificate=no"
         )
 
 

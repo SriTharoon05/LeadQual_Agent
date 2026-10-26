@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.chat.router import answer as run_chat
 from app.database import get_db, locked_chat_session
+from app.utils.db_availability import database_unavailable_reason, warn_database_unavailable
 from app.models import ChatConversation, ChatMessage, Job
 from app.utils.lead_identity import json_object, transaction_lock
 from app.validators.evidence import citation_key, safe_url
@@ -201,9 +202,12 @@ def chat(job_id: UUID, body: ChatRequest):
         raise
     except TimeoutError:
         raise HTTPException(status_code=503, detail="A reply is already being prepared. Retry in a moment.", headers={"Retry-After": "2"}) from None
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
+        if database_unavailable_reason(exc):
+            warn_database_unavailable(logger, "chat", exc)
+            raise HTTPException(status_code=503, detail="The lead database is unavailable. Check database connectivity and Azure SQL firewall access, then retry this message.", headers={"Retry-After": "5"}) from None
         logger.exception("Chat database operation failed for job=%s request=%s", scope, body.request_id)
-        raise HTTPException(status_code=503, detail="The lead database is temporarily unavailable. Retry this message shortly.", headers={"Retry-After": "3"}) from None
+        raise HTTPException(status_code=500, detail="The assistant could not read the requested data. Please report this error.") from None
     except Exception:
         logger.exception("Chat failed for job=%s request=%s", scope, body.request_id)
         raise HTTPException(status_code=503, detail="The assistant could not complete this reply. Retry this message shortly.", headers={"Retry-After": "3"}) from None
@@ -228,7 +232,10 @@ def chat_history(job_id: UUID, conversation_id: UUID | None = Query(default=None
             query = query.filter(ChatMessage.sequence < before_sequence)
         rows = query.order_by(ChatMessage.sequence.desc()).limit(limit).all()
         return [_message(row) for row in reversed(rows)]
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
         db.rollback()
+        if database_unavailable_reason(exc):
+            warn_database_unavailable(logger, "chat history", exc)
+            raise HTTPException(status_code=503, detail="Chat history is unavailable. Check database connectivity and Azure SQL firewall access, then retry.", headers={"Retry-After": "5"}) from None
         logger.exception("Chat history unavailable for job=%s", scope)
-        raise HTTPException(status_code=503, detail="Chat history is temporarily unavailable. Please retry.") from None
+        raise HTTPException(status_code=500, detail="Chat history could not be read. Please report this error.") from None

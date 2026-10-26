@@ -16,6 +16,7 @@ from app.config import settings
 from app.database import SessionLocal, db_session, locked_lead_session
 from app.models import CompanyScrape, Lead
 from app.scraper.web_scraper import research_company
+from app.utils.db_availability import database_unavailable_reason
 from app.utils.lead_identity import transaction_lock
 from app.vectorstore.embedder import chunk_text, embed
 from app.vectorstore.qdrant_store import upsert_chunks
@@ -123,7 +124,9 @@ def recover_ingestion_requests():
     for row in rows:
         try:
             dispatch_ingestion(str(row.id))
-        except Exception:
+        except Exception as exc:
+            if database_unavailable_reason(exc):
+                raise  # One outage must not trigger another 49 failed writes.
             logger.exception("Could not recover document ingestion %s", row.id)
 
 

@@ -140,7 +140,7 @@ def enrich_evidence(db, job_id, plan, scope, data):
     matched = base_query(db, job_id, plan, scope).filter(Lead.id.in_(ids)).enable_eagerloads(True).options(
         selectinload(Lead.final_score), selectinload(Lead.validation_results),
         noload(Lead.company_scrape), selectinload(Lead.tracking), noload(Lead.refresh_requests)
-    ).limit(12).all() if ids else []
+    ).order_by(Lead.row_index.asc(), Lead.id.asc()).limit(12).all() if ids else []
     icp = db.query(Job.icp_prompt).filter(Job.id == job_id).scalar()
     refreshes = latest_refreshes(db, [lead.id for lead in matched])
     websites = latest_scrapes(db, [lead.id for lead in matched], job_id)

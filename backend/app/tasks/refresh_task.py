@@ -19,6 +19,10 @@ from app.tasks.tasks import (
     _lead_to_dict, _num, _save_validation, _set_cached_web, _web_score,
 )
 from app.utils.lead_identity import json_object
+from app.utils.db_availability import (
+    RecoveryBackoff, database_retry_delay, database_unavailable_reason,
+    warn_database_unavailable,
+)
 from app.validators.contact_verifier import verify_contact
 from app.validators.icp_validator import validate_icp
 from app.validators.web_researcher import research_lead
@@ -100,6 +104,12 @@ def refresh_lead(self, request_id: str, lead_id: str):
         # reconciliation can redispatch if the bounded retries are exhausted.
         raise self.retry(exc=exc, countdown=30)
     except Exception as exc:
+        if database_unavailable_reason(exc):
+            warn_database_unavailable(logger, "Evidence refresh", exc)
+            raise self.retry(
+                countdown=database_retry_delay(self.request.retries),
+                max_retries=self.request.retries + 1,
+            )
         logger.exception("Evidence refresh task %s failed", request_id)
         raise self.retry(exc=exc, countdown=min(300, 30 * (self.request.retries + 1)))
 
@@ -206,8 +216,12 @@ def _refresh(db, request_id: str, lead_id: str):
         from app.tasks.embed_task import persist_and_dispatch_embed
         persist_and_dispatch_embed(db, lead, web, force=True)
         return
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        if database_unavailable_reason(exc):
+            # Leave the durable running request and prior saved result intact.
+            # An unavailable SQL connection is not a failed research outcome.
+            raise
         run = db.get(LeadRefresh, request_id)
         if run is not None and run.status not in ("completed", "failed"):
             terminal = int(run.attempt_count or 0) >= MAX_RESEARCH_ATTEMPTS
@@ -242,7 +256,12 @@ def recover_refresh_requests(sender=None, **_kwargs):
         from app.refresh import (
             DISPATCH_INTERVAL_SECONDS, STALE_RUNNING_SECONDS, dispatch_refresh,
         )
+        backoff = RecoveryBackoff("Refresh reconciliation", logger, DISPATCH_INTERVAL_SECONDS)
         while not _recovery_stop.is_set():
+            if not backoff.ready():
+                if _recovery_stop.wait(5):
+                    break
+                continue
             try:
                 now = _now()
                 dispatch_due = or_(LeadRefresh.last_dispatched_at.is_(None),
@@ -266,11 +285,15 @@ def recover_refresh_requests(sender=None, **_kwargs):
                         break
                     try:
                         dispatch_refresh(request_id)
-                    except Exception:
+                    except Exception as exc:
+                        if database_unavailable_reason(exc):
+                            raise
                         logger.exception("Could not recover refresh request %s", request_id)
-            except Exception:
-                logger.exception("Refresh reconciliation scan failed")
-            if _recovery_stop.wait(DISPATCH_INTERVAL_SECONDS):
+            except Exception as exc:
+                backoff.failed(exc)
+            else:
+                backoff.succeeded()
+            if _recovery_stop.wait(5):
                 break
 
     _recovery_thread = threading.Thread(target=recover, name="refresh-reconciliation", daemon=True)
