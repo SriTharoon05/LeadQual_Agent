@@ -38,7 +38,7 @@ class Job(Base):
         UNIQUEIDENTIFIER, primary_key=True, default=_new_uuid
     )
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="queued")
-    # queued | running | completed | failed
+    # importing | import_failed | queued | running | paused | completed | failed
 
     total_rows: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     processed_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

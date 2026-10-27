@@ -177,11 +177,16 @@ def _process_lead(self, db, lead_id, icp_prompt):
         return
 
     log.set_job_id(lead.job_id)
-    log.info(f"Processing lead: {lead.contact_name} @ {lead.company_name}")
     bind_context(job_id=lead.job_id, lead_id=lead_id, company=lead.company_name)
 
     if lead.processing_status in ("completed", "failed"):
         return
+    # Read the durable status for every delivery, including retries and stale
+    # messages already in Redis. Paused deliveries are acknowledged; resume
+    # republishes unfinished rows. Work admitted before pause may finish.
+    if db.query(Job.status).filter(Job.id == lead.job_id).scalar() != "running":
+        return
+    log.info(f"Processing lead: {lead.contact_name} @ {lead.company_name}")
     if lead.final_score:
         _mark_lead_finished(db, lead, failed=False)
         return
@@ -395,6 +400,8 @@ def _process_lead(self, db, lead_id, icp_prompt):
 @celery.task(name="app.tasks.tasks.finalise_job", bind=True, max_retries=1)
 def finalise_job(self, results: list, job_id: str):
     with db_session() as db:
+        from app.utils.lead_identity import transaction_lock
+        transaction_lock(db, "ql:dispatch:" + job_id)
         log = pipeline_logger(db, job_id=job_id)
         try:
             job: Job = db.query(Job).filter(Job.id == job_id).first()
@@ -404,6 +411,8 @@ def finalise_job(self, results: list, job_id: str):
         if not job:
             log.error(f"Job {job_id} not found in finalise_job")
             return
+        if job.status != "running":
+            return  # A stale finalizer must never undo pause or terminal state.
 
         total = db.query(Lead).filter(Lead.job_id == job_id).count()
         processed = db.query(Lead).filter(Lead.job_id == job_id,

@@ -31,6 +31,7 @@ export function StatusBadge({ status }: { status: JobStatus | null | undefined }
     failed:        { color: 'danger',  label: 'Failed' },
     importing:     { color: 'warning', label: 'Importing',      pulse: true },
     import_failed: { color: 'danger',  label: 'Import Failed' },
+    paused:        { color: 'warning', label: 'Paused' },
   };
 
   const cfg = map[status] ?? { color: 'neutral' as const, label: status };

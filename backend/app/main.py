@@ -445,6 +445,40 @@ def dashboard_stats(db: Session = Depends(get_db)):
 
 
 # ── GET /jobs/{job_id}/status ─────────────────────────────────────────────────
+@app.post("/jobs/{job_id}/pause", response_model=JobStatusResponse)
+def pause_job(job_id: str, db: Session = Depends(get_db)):
+    """Stop new lead starts; admitted/in-flight leads may finish safely."""
+    transaction_lock(db, "ql:dispatch:" + job_id)
+    job = _get_job_or_404(job_id, db)
+    if job.status not in ("running", "paused"):
+        raise HTTPException(409, "Only a running job can be paused.")
+    job.status = "paused"
+    db.commit()
+    db.refresh(job)
+    return _job_to_status(job)
+
+
+@app.post("/jobs/{job_id}/resume", response_model=JobStatusResponse)
+def resume_job(job_id: str, db: Session = Depends(get_db)):
+    """Replay unfinished rows, including deliveries acknowledged while paused."""
+    transaction_lock(db, "ql:dispatch:" + job_id)
+    job = _get_job_or_404(job_id, db)
+    if job.status not in ("paused", "running"):
+        raise HTTPException(409, "Only a paused job can be resumed.")
+    if job.status == "paused":
+        job.status = "running"
+        job.dispatch_row_index = job.dispatch_lead_id = None
+        job.dispatch_complete = job.processed_rows >= (job.total_rows or 0)
+        job.dispatch_updated_at = None
+    db.commit()
+    try:
+        request_dispatch(job_id, force=True)
+    except Exception:
+        logger.warning("Job recovery will retry resumed job %s", job_id)
+    db.refresh(job)
+    return _job_to_status(job)
+
+
 @app.get("/jobs/{job_id}/status", response_model=JobStatusResponse)
 def job_status(job_id: str, db: Session = Depends(get_db)):
     job = _get_job_or_404(job_id, db)
@@ -614,8 +648,8 @@ def delete_job(job_id: UUID, background_tasks: BackgroundTasks, db: Session = De
             upload_lease.acquire()
         except Exception as exc:
             raise HTTPException(409, "The file is still transferring. Wait for it to finish before deleting.") from exc
-    elif job.status in ("running", "importing"):
-        raise HTTPException(409, "Wait for this upload to finish before deleting it.")
+    elif job.status in ("running", "paused", "importing"):
+        raise HTTPException(409, "Resume paused processing and wait for this upload to finish before deleting it.")
     try:
         try:
             transaction_lock(db, "ql:artifacts:" + job_id, timeout_ms=0)

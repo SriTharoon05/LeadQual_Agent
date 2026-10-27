@@ -59,6 +59,16 @@ export const getJobStatus = async (jobId: string, signal?: AbortSignal): Promise
   return data;
 };
 
+export const pauseJob = async (jobId: string): Promise<JobStatusResponse> => {
+  const { data } = await apiClient.post<JobStatusResponse>(`/jobs/${jobId}/pause`);
+  return data;
+};
+
+export const resumeJob = async (jobId: string): Promise<JobStatusResponse> => {
+  const { data } = await apiClient.post<JobStatusResponse>(`/jobs/${jobId}/resume`);
+  return data;
+};
+
 // ── Results (paginated) ──────────────────────────────────────────────────────
 // Backend returns: { items, total, limit, offset, returned, has_more }
 export interface PaginatedLeads {

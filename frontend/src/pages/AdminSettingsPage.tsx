@@ -39,7 +39,7 @@ export function AdminSettingsPage() {
   function accepted(data: AdminSettings) { qc.setQueryData(['admin-settings'], data); setDraft(draftFrom(data)); setDirty(false); void qc.invalidateQueries({ queryKey: ['admin-cost'] }); }
   async function save() {
     if (!draft || sending.current) return;
-    const rates = Object.fromEntries(RATE_FIELDS.map(([key]) => [key, Number(draft.rates[key])])) as NonNullable<SettingsSave['pricing']>;
+    const rates = Object.fromEntries(RATE_FIELDS.map(([key]) => [key, Number(draft.rates[key])])) as Record<typeof RATE_FIELDS[number][0], number>;
     if (RATE_FIELDS.some(([key]) => draft.rates[key].trim() === '' || !Number.isFinite(rates[key]) || rates[key] < 0 || rates[key] > 10000)
         || (draft.fx !== '' && (!Number.isFinite(Number(draft.fx)) || Number(draft.fx) <= 0 || Number(draft.fx) > 10000))) {
       setError('Enter valid nonnegative rates; USD/INR must be positive.'); return;

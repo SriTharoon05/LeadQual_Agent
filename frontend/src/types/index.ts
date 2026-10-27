@@ -12,7 +12,7 @@ export interface HealthResponse {
 }
 
 // ── Jobs ────────────────────────────────────────────────────────────────────
-export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'importing' | 'import_failed';
+export type JobStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'importing' | 'import_failed';
 export type ProcessingMode = 'reuse' | 'fresh';
 export type Priority  = 'High' | 'Medium' | 'Low';
 

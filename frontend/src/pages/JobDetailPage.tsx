@@ -9,6 +9,7 @@ import {
   ChevronsLeft, ChevronsRight, Building2, Mail, Loader2, Target, Zap,
 } from 'lucide-react';
 import { TopBar } from '@/components/TopBar';
+import { JobControls } from '@/components/JobControls';
 import { ProcessingModeChoice } from '@/components/ProcessingModeChoice';
 import { LeadTracking } from '@/components/LeadTracking';
 import { EvidenceBadge } from '@/components/LeadEvidenceRefresh';
@@ -92,7 +93,7 @@ function JobDetailContent({ jobId }: { jobId: string }) {
     queryFn: ({ signal }) => getResultsPage(jobId, page * PAGE_SIZE, PAGE_SIZE, {
       search: deferredSearch, priority: priorityFilter, sortBy: sortKey, sortDir,
     }, signal),
-    enabled: isCompleted || status?.status === 'failed',
+    enabled: isCompleted || status?.status === 'failed' || status?.status === 'paused',
     placeholderData: (prev, previousQuery) => previousQuery?.queryKey[4] === deferredSearch
       && previousQuery.queryKey[5] === priorityFilter && previousQuery.queryKey[6] === sortKey
       && previousQuery.queryKey[7] === sortDir ? prev : undefined,
@@ -181,7 +182,7 @@ function JobDetailContent({ jobId }: { jobId: string }) {
     } catch {
       try {
         const current = await getJobStatus(jobId);
-        if (['running', 'completed', 'failed'].includes(current.status)
+        if (['running', 'paused', 'completed', 'failed'].includes(current.status)
             && current.icp_prompt === resumeIcp.trim() && (current.processing_mode ?? 'reuse') === processingMode) {
           qc.setQueryData(['job-status', jobId], current);
           toast('Processing was accepted. The current status is now loaded.', 'info');
@@ -230,6 +231,7 @@ function JobDetailContent({ jobId }: { jobId: string }) {
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <JobControls jobId={jobId} status={status?.status} />
               {(isCompleted || status?.status === 'failed') && <Button size="sm" variant="outline" icon={<Zap className="h-3.5 w-3.5" />} onClick={() => navigate('/upload', { state: { icpPrompt: status?.icp_prompt || '', processingMode: 'fresh' } })}>New run</Button>}
               <Button size="sm" variant="outline" icon={<RefreshCw className="h-3.5 w-3.5" />}
                 onClick={handleRefresh}>
@@ -243,17 +245,17 @@ function JobDetailContent({ jobId }: { jobId: string }) {
                 onClick={() => exports.start(jobId, 'csv')} disabled={!isCompleted || exports.isBusy(jobId, 'csv')}>
                 CSV
               </Button>
-              <Button size="sm" variant="danger" icon={<Trash2 className="h-3.5 w-3.5" />} onClick={handleDelete}>
+              <Button size="sm" variant="danger" disabled={isRunning || status?.status === 'paused'} icon={<Trash2 className="h-3.5 w-3.5" />} onClick={handleDelete}>
                 Delete
               </Button>
             </div>
           </div>
 
           {/* Progress bar if running */}
-          {isRunning && (
+          {(isRunning || status?.status === 'paused') && (
             <div className="mt-4">
               <div className="flex justify-between text-xs text-slate-500 mb-1.5">
-                <span>Processing…</span>
+                <span>{status?.status === 'paused' ? 'Paused — saved progress' : 'Processing…'}</span>
                 <span className="font-semibold tabular-nums">{(status?.progress_pct ?? 0).toFixed(0)}%</span>
               </div>
               <div className="h-2.5 rounded-full bg-slate-100 overflow-hidden">

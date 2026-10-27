@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { TopBar } from '@/components/TopBar';
+import { JobControls } from '@/components/JobControls';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Badge, StatusBadge } from '@/components/ui/Badge';
@@ -181,6 +182,7 @@ function JobsTable({ jobs, onDelete, onExport, isExporting }: {
                 <td className="px-4 py-3 text-slate-500 whitespace-nowrap">{fmtDate(job.created_at)}</td>
                 <td className="px-4 py-3">
                   <div className="flex items-center justify-end gap-1">
+                    <JobControls jobId={job.job_id} status={job.status} compact />
                     <Link to={`/jobs/${job.job_id}`} onClick={(e) => e.stopPropagation()}>
                       <Button size="sm" variant="ghost" icon={<Eye className="h-3.5 w-3.5" />}>View</Button>
                     </Link>
@@ -190,7 +192,7 @@ function JobsTable({ jobs, onDelete, onExport, isExporting }: {
                     <button disabled={job.status !== 'completed' || isExporting(job.job_id, 'csv')} onClick={(e) => onExport(job.job_id, 'csv', e)} title="Export all rows to CSV" aria-label="Export all rows to CSV" className="rounded-lg p-2 text-sky-600 hover:bg-sky-50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
                       {isExporting(job.job_id, 'csv') ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
                     </button>
-                    <button onClick={(e) => onDelete(job.job_id, e)} title="Delete" className="rounded-lg p-2 text-rose-500 hover:bg-rose-50 transition-colors">
+                    <button disabled={['running', 'paused', 'importing'].includes(job.status)} onClick={(e) => onDelete(job.job_id, e)} title="Delete" className="rounded-lg p-2 text-rose-500 hover:bg-rose-50 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
                       <Trash2 className="h-4 w-4" />
                     </button>
                   </div>

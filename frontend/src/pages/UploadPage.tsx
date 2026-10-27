@@ -7,6 +7,7 @@ import {
   Loader2, ArrowRight, FileUp, Target, Zap,
 } from 'lucide-react';
 import { TopBar } from '@/components/TopBar';
+import { JobControls } from '@/components/JobControls';
 import { ProcessingModeChoice } from '@/components/ProcessingModeChoice';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -98,7 +99,7 @@ export function UploadPage() {
       if (candidate.recovered) {
         try {
           const existing = await getJobStatus(requestId);
-          if (['running', 'completed', 'failed', 'import_failed'].includes(existing.status)) {
+          if (['running', 'paused', 'completed', 'failed', 'import_failed'].includes(existing.status)) {
             requestId = uploadRequestId(file, true).id;
             uploadRequest.current = { file, id: requestId };
           }
@@ -155,7 +156,7 @@ export function UploadPage() {
     } catch {
       try {
         const current = await getJobStatus(jobId);
-        if (['running', 'completed', 'failed'].includes(current.status)
+        if (['running', 'paused', 'completed', 'failed'].includes(current.status)
             && current.icp_prompt === icpPrompt.trim() && (current.processing_mode ?? 'reuse') === processingMode) {
           forgetUploadRequest(jobId);
           toast('The processing request was accepted. Loading its current status.', 'info');
@@ -367,7 +368,7 @@ useEffect(() => {
     notified.current = true;
     onFailed(status?.import_error ?? 'Import failed');
   }
-  if (!notified.current && s && ['running', 'completed', 'failed'].includes(s)) {
+  if (!notified.current && s && ['running', 'paused', 'completed', 'failed'].includes(s)) {
     notified.current = true;
     onAlreadyStarted();
   }
@@ -431,7 +432,7 @@ function ProcessingView({ jobId, onComplete, onDashboard }: {
           <CheckCircle2 className="h-8 w-8 text-emerald-500" />
         ) : (
           <div className="flex h-8 w-8 items-center justify-center rounded-full bg-brand-100">
-            <Loader2 className="h-5 w-5 text-brand-500 animate-spin" />
+            <Loader2 className={`h-5 w-5 text-brand-500 ${jobStatus === 'paused' ? '' : 'animate-spin'}`} />
           </div>
         )}
         <div>
@@ -440,6 +441,8 @@ function ProcessingView({ jobId, onComplete, onDashboard }: {
               ? 'Processing failed'
               : jobStatus === 'completed'
               ? 'Processing complete!'
+              : jobStatus === 'paused'
+              ? 'Job paused'
               : 'Processing your leads…'}
           </p>
           <p className="text-xs text-slate-500">
@@ -469,7 +472,7 @@ function ProcessingView({ jobId, onComplete, onDashboard }: {
       <div className="space-y-3">
         {STAGES.map((stage, i) => {
           const done = i < activeStageIdx || jobStatus === 'completed';
-          const active = i === activeStageIdx && jobStatus !== 'completed' && jobStatus !== 'failed';
+          const active = i === activeStageIdx && jobStatus === 'running';
           const failed = jobStatus === 'failed' && i === activeStageIdx;
           return (
             <div key={stage.label} className="flex items-center gap-3">
@@ -497,11 +500,13 @@ function ProcessingView({ jobId, onComplete, onDashboard }: {
         })}
       </div>
 
+      <div className="mt-6"><JobControls jobId={jobId} status={jobStatus} /></div>
+
       {jobStatus !== 'failed' && jobStatus !== 'completed' && (
         <div className="mt-6 rounded-xl bg-sky-50 ring-1 ring-sky-100 p-4 sm:flex sm:items-center sm:justify-between sm:gap-4">
           <div>
             <p className="text-sm font-medium text-slate-700">No need to stay on this screen</p>
-            <p className="text-xs text-slate-500 mt-1">Processing is asynchronous. The dashboard lobby keeps showing live progress while you do other work.</p>
+            <p className="text-xs text-slate-500 mt-1">The dashboard keeps showing saved progress. A paused job stays paused until you resume it.</p>
           </div>
           <Button variant="outline" className="mt-3 sm:mt-0 shrink-0" onClick={onDashboard}>
             Go to Dashboard &amp; Wait

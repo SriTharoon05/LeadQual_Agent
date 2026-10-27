@@ -1,5 +1,20 @@
 # Quality Lead — end-to-end technical explanation
 
+## Current guides and job controls
+
+- [Costing Guide (Word)](docs/Quality_Lead_Costing_Guide.docx): reference tariffs,
+  formulas, batch estimates, reuse, infrastructure and accounting limitations.
+- [Scoring Guide (Word)](docs/Quality_Lead_Scoring_Guide.docx): current 60% ICP /
+  25% contact / 15% growth policy, proof rules, score caps and worked examples.
+- [Pause/resume rollout](backend/RELEASE_JOB_CONTROLS.md): deployment and API details.
+
+Running qualification jobs have **Pause job** and **Resume job** controls on the
+dashboard, job detail and upload progress pages. Pause stops new lead starts;
+in-flight leads finish safely. Resume preserves results and continues unfinished
+leads. Deploy matching API/frontend/workers and restart old workers before use.
+The Word scoring guide describes the current policy; the historical five-factor
+architecture explanation below predates scoring v2.
+
 **Current release:** follow [the admin operations guide](backend/RELEASE_ADMIN_OPERATIONS.md)
 for SQL-backed concurrency, warning/error logs and detailed usage costs. Team
 profiles, assignments, follow-up reminders, saved groups and the lead workspace
