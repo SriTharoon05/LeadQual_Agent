@@ -23,6 +23,7 @@ from app.utils.db_availability import (
 from app.utils.company_logger import CompanyLogger
 from app.admin.concurrency import LeadAdmission, CapacityDeferred, RuntimeLeaseLost, retry_delay
 from app.admin.billing import rate_limit_delay
+from app.utils.job_pause import JobPaused, assert_job_not_paused
 
 from app.validators.icp_validator import ICPResult, validate_icp
 from app.validators.web_researcher import research_lead
@@ -121,8 +122,11 @@ def process_lead(self, lead_id: str, icp_prompt: str):
     DB reuse check → Web → Contact → ICP using evidence → Score → DB
     """
     try:
+        assert_job_not_paused(lead_id=lead_id)
         with LeadAdmission(), locked_lead_session(lead_id) as db:
             return _process_lead(self, db, lead_id, icp_prompt)
+    except JobPaused:
+        return  # Resume republishes unfinished leads; no retry/failure budget.
     except (CapacityDeferred, RuntimeLeaseLost):
         raise self.retry(countdown=retry_delay(), max_retries=self.request.retries + 1)
     except TimeoutError as exc:
@@ -387,7 +391,7 @@ def _process_lead(self, db, lead_id, icp_prompt):
         _mark_lead_finished(db, lead, failed=False)
 
     except Exception as exc:
-        if isinstance(exc, (CapacityDeferred, RuntimeLeaseLost)) or rate_limit_delay(exc) is not None or database_unavailable_reason(exc):
+        if isinstance(exc, (JobPaused, CapacityDeferred, RuntimeLeaseLost)) or rate_limit_delay(exc) is not None or database_unavailable_reason(exc):
             raise  # The outer task logs/backoffs; do not try writing a DB log.
         log.error(f"Pipeline error for {lead_id}: {exc}")
         try:

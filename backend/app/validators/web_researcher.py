@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from app.llm_engine import llm_json_with_sources, SYSTEM_WEB_RESEARCHER
 from app.validators.evidence import normalize_evidence, clean_sources, utc_checked_at
+from app.utils.job_pause import JobPaused
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,8 @@ Return JSON including "evidence" plus these keys:
 
         all_sources = list(urls)
 
+    except JobPaused:
+        raise
     except Exception as e:
         logger.warning(f"Web research combined call failed for '{company}': {e}")
         raise

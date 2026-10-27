@@ -14,7 +14,8 @@ from sqlalchemy.orm import aliased, load_only, noload
 from app.celery_app import celery
 from app.config import settings
 from app.database import SessionLocal, db_session, locked_lead_session
-from app.models import CompanyScrape, Lead
+from app.models import CompanyScrape, Job, Lead
+from app.utils.job_pause import JobPaused, background_allowed
 from app.scraper.web_scraper import research_company
 from app.utils.db_availability import database_unavailable_reason
 from app.utils.lead_identity import transaction_lock
@@ -83,10 +84,12 @@ def dispatch_ingestion(scrape_id, *, force=False):
     with db_session() as db:
         transaction_lock(db, "ql:ingest-dispatch:" + scrape_id)
         row = db.query(CompanyScrape).options(load_only(
-            CompanyScrape.id, CompanyScrape.lead_id, CompanyScrape.ingest_status,
+            CompanyScrape.id, CompanyScrape.job_id, CompanyScrape.lead_id, CompanyScrape.ingest_status,
             CompanyScrape.ingest_attempts, CompanyScrape.ingest_dispatched_at,
             CompanyScrape.ingest_error)).filter(CompanyScrape.id == scrape_id).first()
         if row is None or row.ingest_status in ("completed", "failed"):
+            return
+        if not background_allowed(db, row.job_id):
             return
         previous = row.ingest_dispatched_at
         if previous and previous.tzinfo:
@@ -109,7 +112,8 @@ def recover_ingestion_requests():
     now = _now()
     with db_session() as db:
         newer = aliased(CompanyScrape)
-        rows = db.query(CompanyScrape.id).filter(
+        rows = db.query(CompanyScrape.id).join(Job, Job.id == CompanyScrape.job_id).filter(
+            Job.status != "paused",
             CompanyScrape.ingest_status.in_(("queued", "scraping", "embedding")),
             ~exists().where(newer.lead_id == CompanyScrape.lead_id, or_(
                 newer.scraped_at > CompanyScrape.scraped_at,
@@ -131,6 +135,8 @@ def recover_ingestion_requests():
 
 
 def _claim(db, row, phase):
+    if not background_allowed(db, row.job_id):
+        return False
     if row.ingest_status in ("completed", "failed"):
         return False
     latest = _latest_query(db, row.lead_id).with_entities(CompanyScrape.id).first()
@@ -147,6 +153,28 @@ def _claim(db, row, phase):
     row.ingest_error = None
     db.commit()
     return True
+
+
+def _defer_paused(db, scrape_id, phase):
+    """Keep the checkpoint without turning pause into a failed attempt."""
+    db.rollback()
+    row = db.get(CompanyScrape, scrape_id)
+    if row is not None and row.ingest_status not in ("completed", "failed"):
+        row.ingest_status = phase
+        row.ingest_attempts = max(0, int(row.ingest_attempts or 0) - 1)
+        row.ingest_dispatched_at = None
+        row.ingest_error = None
+        db.commit()
+
+
+def _retry_ingestion(task, scrape_id, exc, countdown):
+    # A task that was waiting on a lock or failed just as pause happened must
+    # not keep a retry loop alive for that paused job.
+    with SessionLocal() as db:
+        row = db.query(CompanyScrape.job_id).filter(CompanyScrape.id == scrape_id).first()
+        if row is None or not background_allowed(db, row.job_id):
+            return
+    raise task.retry(exc=exc, countdown=countdown)
 
 
 def _failure(db, scrape_id, phase, exc):
@@ -209,14 +237,17 @@ def ingest_company(self, scrape_id):
                 row.embedded, row.chunk_count = 0, 0
                 row.ingest_status, row.ingest_dispatched_at, row.ingest_error = "embedding", None, None
                 db.commit()
+            except JobPaused:
+                _defer_paused(db, scrape_id, "queued")
+                return
             except Exception as exc:
                 _failure(db, scrape_id, "queued", exc)
                 raise
         dispatch_ingestion(scrape_id, force=True)
     except TimeoutError as exc:
-        raise self.retry(exc=exc, countdown=10)
+        return _retry_ingestion(self, scrape_id, exc, countdown=10)
     except Exception as exc:
-        raise self.retry(exc=exc, countdown=30)
+        return _retry_ingestion(self, scrape_id, exc, countdown=30)
 
 
 @celery.task(bind=True, name="app.tasks.embed_task.embed_company", max_retries=5,
@@ -261,13 +292,16 @@ def embed_company(self, scrape_id):
                 row.embedded, row.chunk_count = 1, written
                 row.ingest_status, row.ingest_error = "completed", None
                 db.commit()
+            except JobPaused:
+                _defer_paused(db, scrape_id, "embedding")
+                return
             except Exception as exc:
                 _failure(db, scrape_id, "embedding", exc)
                 raise
     except TimeoutError as exc:
-        raise self.retry(exc=exc, countdown=10)
+        return _retry_ingestion(self, scrape_id, exc, countdown=10)
     except Exception as exc:
-        raise self.retry(exc=exc, countdown=30)
+        return _retry_ingestion(self, scrape_id, exc, countdown=30)
 
 
 def _archive_raw_to_blob(job_id, lead_id, research):

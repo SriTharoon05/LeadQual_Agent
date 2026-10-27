@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from app.scoring.policy import SCORING_VERSION, qualification, validated_checks
 from app.validators.contact_policy import saved_contact
 from app.validators.evidence import normalize_evidence
+from app.utils.job_pause import JobPaused
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,8 @@ def score_lead(lead_data, icp_result, web_result, contact_result,
                 if isinstance(raw.get("talking_points"), list):
                     draft["talking_points"] = [item[:500] for item in raw["talking_points"][:5] if isinstance(item, str)]
                 result.outreach_intelligence = json.dumps(draft, ensure_ascii=False)
+    except JobPaused:
+        raise  # Preserve saved stages and resume outreach after unpause.
     except Exception as exc:
         logger.warning("Outreach draft unavailable for lead %s (%s); deterministic qualification retained", lead_id, type(exc).__name__)
     result.raw_output = json.dumps(result.to_dict(), ensure_ascii=False)

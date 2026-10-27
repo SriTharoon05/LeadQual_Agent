@@ -8,6 +8,7 @@ from uuid import uuid4
 from app.admin.concurrency import before_model_call, CapacityDeferred
 from app.admin.settings import load_settings, redis_client, utcnow
 from app.admin.telemetry import _context, current_context, enqueue, publish_event, valid_id, mark_rate_limit
+from app.utils.job_pause import assert_job_not_paused
 
 
 def get(value, name, default=None):
@@ -47,15 +48,20 @@ class metered_call:
         self.response = None
 
     def __enter__(self):
-        before_model_call()
         context = current_context()
-        self.context_token = _context.set({**context, "stage": self.stage, "component": self.module,
-            **({"job_id": str(self.job_id)} if self.job_id else {}),
-            **({"lead_id": str(self.lead_id)} if self.lead_id else {})})
+        before_model_call()
         try:
             self.settings = load_settings()
         except Exception:
             self.settings = None
+        # Covers LLM/search requests and every embedding batch, not just new
+        # qualification tasks. Check after potentially slow settings/lease reads
+        # and before journaling an attempt or admitting a provider request.
+        assert_job_not_paused(self.job_id or context.get("job_id"),
+                              lead_id=self.lead_id or context.get("lead_id"))
+        self.context_token = _context.set({**context, "stage": self.stage, "component": self.module,
+            **({"job_id": str(self.job_id)} if self.job_id else {}),
+            **({"lead_id": str(self.lead_id)} if self.lead_id else {})})
         self.id = str(uuid4())
         self.created_at = utcnow().isoformat()
         current = current_context()

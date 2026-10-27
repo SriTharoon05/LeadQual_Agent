@@ -9,9 +9,11 @@
 - [Pause/resume rollout](backend/RELEASE_JOB_CONTROLS.md): deployment and API details.
 
 Running qualification jobs have **Pause job** and **Resume job** controls on the
-dashboard, job detail and upload progress pages. Pause stops new lead starts;
-in-flight leads finish safely. Resume preserves results and continues unfinished
-leads. Deploy matching API/frontend/workers and restart old workers before use.
+dashboard, job detail and upload progress pages. Pause stops new lead starts,
+new paid AI requests, and queued website indexing/embeddings. In-flight requests
+and delayed usage reports can still finish. Resume preserves results and continues
+unfinished work. Deploy matching API/frontend/workers and restart all old workers,
+including embedding workers, before use.
 The Word scoring guide describes the current policy; the historical five-factor
 architecture explanation below predates scoring v2.
 

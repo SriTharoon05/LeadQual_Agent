@@ -18,7 +18,7 @@ export function JobControls({ jobId, status, compact = false }: {
     onSuccess: async (job) => {
       await qc.cancelQueries({ queryKey: ['job-status', jobId] });
       qc.setQueryData(['job-status', jobId], job);
-      toast(job.status === 'paused' ? 'Job paused. In-flight leads may still finish.' : 'Job resumed.', 'success');
+      toast(job.status === 'paused' ? 'Job paused. Requests already in progress may finish.' : 'Job resumed.', 'success');
     },
     onError: (error) => {
       const detail = isAxiosError(error) ? error.response?.data?.detail : undefined;
@@ -43,8 +43,8 @@ export function JobControls({ jobId, status, compact = false }: {
         {paused ? 'Resume job' : 'Pause job'}
       </Button>
       {!compact && <p className="text-xs text-slate-500 max-w-sm">
-        {paused ? 'Paused. In-flight leads may finish; new leads will wait. Resume keeps all saved progress.'
-          : 'Pause stops new leads from starting. Leads already in progress finish safely.'}
+        {paused ? 'Paused. New AI calls and website indexing wait. In-flight requests and delayed cost reports may still finish. Saved progress is kept.'
+          : 'Pause stops new AI calls and website indexing. Requests already in progress may finish.'}
       </p>}
     </div>
   );

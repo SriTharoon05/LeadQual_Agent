@@ -195,7 +195,7 @@ def cost_guide():
         ["Fresh AI research", "New web research, ICP comparison, optional outreach draft and embeddings.", "Use the full new-lead assumption; retries may add cost."],
         ["Full result reuse", "Compatible saved scores/results copied with no new per-lead qualification AI calls.", "Zero new qualification AI cost for that copy; import/hosting still apply."],
         ["Research-only reuse", "Web research skipped; contact/ICP/scoring still run; job-scoped indexing may occur.", "Lower expected search cost; not equivalent to a free full result reuse."],
-        ["Resume after pause", "Completed leads skipped; successful saved stages restored for unfinished leads.", "Pause does not refund in-flight requests. Duplicated provider attempts after failures can still cost."],
+        ["Resume after pause", "New AI calls and indexing wait while paused; successful saved stages are restored on resume.", "In-flight calls and late usage can still be billed. Interrupted embedding documents may need batches recomputed on resume."],
         ["Manual evidence refresh", "Fresh research and recalculation for a completed/failed lead.", "A separate operation; budget separately from resuming a job."],
     ], [1.35, 2.95, 2.57])
     para(doc, f"Mixed-batch example: 1,000 leads with 600 full reuses and 400 newly researched leads "

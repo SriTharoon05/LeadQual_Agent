@@ -14,6 +14,7 @@ from typing import Any, Optional
 from openai import OpenAI
 from app.config import settings
 from app.admin.billing import metered_call
+from app.utils.job_pause import JobPaused
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,8 @@ def _call(
                 include=["web_search_call.action.sources"] if use_web_search else [],
             )
             meter.response = response
+    except JobPaused:
+        raise
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
         raise
